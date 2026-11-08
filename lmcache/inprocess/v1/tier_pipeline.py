@@ -141,6 +141,17 @@ class TierWorkerQueue:
                 for status, job in self._entries.values()
             )
 
+    def smallest_waiting_chunks(self) -> Optional[int]:
+        """Smallest queued prefix, in chunks. None when nothing is waiting."""
+        with self._lock:
+            smallest: Optional[int] = None
+            for status, job in self._entries.values():
+                if status != STATUS_INIT or job is None or job.num_chunks <= 0:
+                    continue
+                if smallest is None or job.num_chunks < smallest:
+                    smallest = int(job.num_chunks)
+            return smallest
+
     def drop_if_waiting(self, req_id: str) -> Optional[TierLoad]:
         """Drop a hit that has not started GET. A started GET is left running."""
         key = str(req_id)

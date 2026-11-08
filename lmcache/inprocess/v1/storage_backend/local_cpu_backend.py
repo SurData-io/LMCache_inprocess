@@ -887,7 +887,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return memory_objs
 
     def get_full_chunk_size_bytes(self) -> int:
-        logger.info("Calculating the size of a single LMCache chunk")
+        cached = getattr(self, "_full_chunk_size_bytes", None)
+        if cached is not None:
+            return int(cached)
         assert self.metadata is not None, (
             "metadata required for chunk budget calculation"
         )
@@ -924,7 +926,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             hidden_dim,
         )
         logger.debug("Calculated bytes per chunk per rank: %s", chunk_bytes)
-        return chunk_bytes
+        self._full_chunk_size_bytes = int(chunk_bytes)
+        return int(chunk_bytes)
 
     def calculate_chunk_budget(self) -> int:
         """

@@ -135,8 +135,10 @@ def test_worker_claims_the_oldest_prefix_that_fits():
     assert claimed is not None
     assert claimed[0] == "small"
     assert queue.has_waiting() is True
+    assert queue.smallest_waiting_chunks() == 4
     assert queue.drop_if_waiting("large") is large
     assert queue.is_reading("small") is True
+    assert queue.smallest_waiting_chunks() is None
 
 
 class _Request:
@@ -686,3 +688,77 @@ def test_stale_cleanup_does_not_cancel_a_newer_contains():
     assert manager.abort_tier_load("r", 1) is True
     assert manager._tier_abort == {}
     assert "r" in manager._tier_open
+
+
+def test_empty_drain_does_not_rescan_when_rearmed():
+    manager = _manager(True, _Backend(0))
+    manager._tier_freed_since_scan = 0
+    manager._tier_release_hold = 0
+    manager._tier_drain_again = False
+    manager.tier_queue.note_lookup("r", 32, _load(8))
+    passes = {"n": 0}
+    original = manager.tier_queue.take_next_fitting
+
+    def counting(fits):
+        passes["n"] += 1
+        manager._tier_drain_again = True
+        return original(fits)
+
+    manager.tier_queue.take_next_fitting = counting
+    manager._aligned_chunk_bytes = lambda: 100
+    manager._host_free_bytes = lambda: 50
+    asyncio.run(manager._tier_drain_once())
+    assert passes["n"] == 1
+    assert manager._tier_release_hold == 800
+    assert manager._tier_drain_again is False
+    assert manager._tier_freed_since_scan == 0
+    assert manager.tier_queue.has_waiting() is True
+
+
+def test_release_coalesces_until_the_smallest_prefix_fits():
+    manager = _manager(True, _Backend(0))
+    manager._tier_freed_since_scan = 0
+    manager._tier_release_hold = 0
+    manager._tier_drain_again = False
+    manager.tier_queue.note_lookup("r", 32, _load(8))
+    free = {"n": 50}
+    manager._aligned_chunk_bytes = lambda: 100
+    manager._host_free_bytes = lambda: free["n"]
+    launched: list[str] = []
+    manager._send_tier_ack = lambda *args, **kwargs: None
+    manager._launch_tier_get = lambda lookup_id, load: launched.append(lookup_id)
+    schedules = {"n": 0}
+
+    def schedule():
+        schedules["n"] += 1
+        asyncio.run(manager._tier_drain_once())
+
+    manager._schedule_tier_drain = schedule
+    manager._note_host_released(100)
+    assert schedules["n"] == 1
+    assert manager._tier_release_hold == 800
+    assert manager._tier_freed_since_scan == 0
+    for _ in range(7):
+        manager._note_host_released(100)
+    assert schedules["n"] == 1
+    assert manager._tier_freed_since_scan == 700
+    free["n"] = 800
+    manager._note_host_released(100)
+    assert schedules["n"] == 2
+    assert launched == ["r"]
+    assert manager.tier_queue.is_reading("r") is True
+
+
+def test_new_lookup_drains_while_a_release_hold_is_set():
+    manager = _manager(True, _Backend(0))
+    manager._tier_freed_since_scan = 0
+    manager._tier_release_hold = 800
+    manager._tier_drain_again = False
+    schedules: list[str] = []
+    manager._schedule_tier_drain = lambda: schedules.append("drain")
+    manager.tier_queue.note_lookup("n", 4, _load(1))
+    manager._schedule_tier_drain()
+    assert schedules == ["drain"]
+    manager._note_host_released(10)
+    assert schedules == ["drain"]
+    assert manager._tier_freed_since_scan == 10

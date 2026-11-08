@@ -283,6 +283,12 @@ class StorageManager:
         self._tier_epoch_inflight: dict[str, int] = {}
         self._tier_drain_task: Optional[asyncio.Task] = None
         self._tier_drain_again = False
+        # Bytes returned since the current drain pass started. An empty pass
+        # sets ``_tier_release_hold`` so a later free does not walk the queue
+        # until a whole waiting prefix could have been freed.
+        self._tier_freed_since_scan = 0
+        self._tier_release_hold = 0
+        self._tier_release_lock = threading.Lock()
 
         # The GPU stream for internal copies during put
         if is_cuda_worker(metadata):
@@ -985,39 +991,63 @@ class StorageManager:
             return int(free())
         return None
 
-    def _prefix_fits(self, load: TierLoad, reserved: int = 0) -> bool:
-        """True when host memory can hold the whole prefix. Unknown size fits."""
+    def _aligned_chunk_bytes(self) -> Optional[int]:
+        """Aligned bytes of one chunk. None when the size is not known."""
         backend = self.local_cpu_backend
-        if not isinstance(backend, LocalCPUBackend) or load.num_chunks <= 0:
-            return True
+        if not isinstance(backend, LocalCPUBackend):
+            return None
         try:
             chunk_bytes = int(backend.get_full_chunk_size_bytes())
         except Exception:
-            return True
+            return None
         if chunk_bytes <= 0:
-            return True
-        alloc = backend.memory_allocator
+            return None
+        alloc = getattr(backend, "memory_allocator", None)
         align = int(getattr(alloc, "align_bytes", 1) or 1)
-        aligned = ((chunk_bytes + align - 1) // align) * align
+        if align <= 0:
+            align = 1
+        return ((chunk_bytes + align - 1) // align) * align
+
+    def _prefix_fits(self, load: TierLoad, reserved: int = 0) -> bool:
+        """True when host memory can hold the whole prefix. Unknown size fits."""
+        aligned = self._aligned_chunk_bytes()
+        if aligned is None or load.num_chunks <= 0:
+            return True
         free = self._host_free_bytes()
         if free is None:
             return True
         return free - reserved >= aligned * load.num_chunks
 
     def _prefix_bytes(self, load: TierLoad) -> int:
-        backend = self.local_cpu_backend
-        if not isinstance(backend, LocalCPUBackend) or load.num_chunks <= 0:
+        aligned = self._aligned_chunk_bytes()
+        if aligned is None or load.num_chunks <= 0:
             return 0
-        try:
-            chunk_bytes = int(backend.get_full_chunk_size_bytes())
-        except Exception:
-            return 0
-        if chunk_bytes <= 0:
-            return 0
-        alloc = backend.memory_allocator
-        align = int(getattr(alloc, "align_bytes", 1) or 1)
-        aligned = ((chunk_bytes + align - 1) // align) * align
         return aligned * load.num_chunks
+
+    def _tier_bytes_lock(self) -> threading.Lock:
+        lock = getattr(self, "_tier_release_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._tier_release_lock = lock
+        return lock
+
+    def _note_host_released(self, nbytes: int) -> None:
+        """Count returned host bytes. Scan only after a whole prefix may fit.
+
+        A new lookup and a finished GET call ``_schedule_tier_drain`` directly.
+        Those must not wait for this threshold: a new hit can be smaller than
+        the prefix that failed the last empty pass.
+        """
+        if nbytes <= 0:
+            return
+        with self._tier_bytes_lock():
+            self._tier_freed_since_scan = int(
+                getattr(self, "_tier_freed_since_scan", 0)
+            ) + int(nbytes)
+            hold = int(getattr(self, "_tier_release_hold", 0))
+            ready = hold <= 0 or self._tier_freed_since_scan >= hold
+        if ready:
+            self._schedule_tier_drain()
 
     def _schedule_tier_drain(self) -> None:
         if not self._split_metadata_lookup_enabled():
@@ -1042,15 +1072,33 @@ class StorageManager:
             return
 
     async def _tier_drain_once(self) -> None:
-        """Start a GET for every queued hit that fits. Leave the ones that do not."""
+        """Start a GET for every queued hit that fits. Leave the ones that do not.
+
+        One pass reads the free bytes and the chunk size once. The predicate
+        only compares those integers, so the queue lock is not held across
+        another allocator query. A pass that starts nothing records the
+        smallest waiting prefix and returns. A free during that pass must not
+        walk the queue again until that many bytes have come back.
+        """
         while True:
+            with self._tier_bytes_lock():
+                self._tier_freed_since_scan = 0
+            aligned = self._aligned_chunk_bytes()
+            free = self._host_free_bytes() if aligned is not None else None
             reserved = 0
             started = False
             while True:
                 budget = reserved
 
-                def fits(load: TierLoad, reserved_bytes: int = budget) -> bool:
-                    return self._prefix_fits(load, reserved_bytes)
+                def fits(
+                    load: TierLoad,
+                    reserved_bytes: int = budget,
+                    chunk_bytes: Optional[int] = aligned,
+                    free_now: Optional[int] = free,
+                ) -> bool:
+                    if chunk_bytes is None or free_now is None or load.num_chunks <= 0:
+                        return True
+                    return free_now - reserved_bytes >= chunk_bytes * load.num_chunks
 
                 item = self.tier_queue.take_next_fitting(fits)
                 if item is None:
@@ -1061,14 +1109,27 @@ class StorageManager:
                     self.tier_queue.finish(lookup_id)
                     self._unpin_tier_load(load)
                     continue
-                reserved += self._prefix_bytes(load)
+                if aligned is not None:
+                    reserved += aligned * load.num_chunks
                 self._send_tier_ack(lookup_id, 0, "reading", load.epoch)
                 self._launch_tier_get(lookup_id, load)
                 started = True
-            if not started or not self._tier_drain_again:
+            if started:
+                with self._tier_bytes_lock():
+                    self._tier_release_hold = 0
+                if not self._tier_drain_again:
+                    return
                 self._tier_drain_again = False
-                return
+                continue
+            chunks = self.tier_queue.smallest_waiting_chunks()
+            hold = 0
+            if aligned is not None and chunks is not None and chunks > 0:
+                hold = aligned * chunks
+            with self._tier_bytes_lock():
+                self._tier_release_hold = hold
+                self._tier_freed_since_scan = 0
             self._tier_drain_again = False
+            return
 
     def _launch_tier_get(self, lookup_id: str, load: TierLoad) -> None:
         if self._abort_matches(lookup_id, load.epoch):
@@ -1280,8 +1341,34 @@ class StorageManager:
                 except Exception:
                     logger.debug("Failed to release prefetched memory", exc_info=True)
 
+    def _memory_obj_bytes(self, memory_obj: Any) -> int:
+        """Physical bytes of one object. Read this before ``free`` invalidates it."""
+        if memory_obj is None:
+            return 0
+        valid = getattr(memory_obj, "is_valid", None)
+        if callable(valid):
+            try:
+                if not valid():
+                    return 0
+            except Exception:
+                return 0
+        meta = getattr(memory_obj, "meta", None)
+        if meta is None:
+            meta = getattr(memory_obj, "metadata", None)
+        if meta is None:
+            return 0
+        try:
+            return max(0, int(getattr(meta, "phy_size", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _released_bytes(self, memory_objs: Any) -> int:
+        if isinstance(memory_objs, (list, tuple)):
+            return sum(self._memory_obj_bytes(obj) for obj in memory_objs)
+        return self._memory_obj_bytes(memory_objs)
+
     def _install_tier_release_hook(self) -> None:
-        """Rescan the queue when host memory is returned to the allocator."""
+        """Count host bytes returned to the allocator. Do not scan per chunk."""
         if not self._split_metadata_lookup_enabled():
             return
         backend = self.local_cpu_backend
@@ -1297,9 +1384,20 @@ class StorageManager:
                 continue
             manager = self
 
-            def _wrapped(*args, _original=original, _manager=manager, **kwargs):
+            def _wrapped(
+                *args,
+                _original=original,
+                _manager=manager,
+                _batched: bool = name == "batched_free",
+                **kwargs,
+            ):
+                released = args[0] if args else None
+                if _batched:
+                    nbytes = _manager._released_bytes(released)
+                else:
+                    nbytes = _manager._memory_obj_bytes(released)
                 result = _original(*args, **kwargs)
-                _manager._schedule_tier_drain()
+                _manager._note_host_released(nbytes)
                 return result
 
             _wrapped._lmcache_tier_wrapped = True  # type: ignore[attr-defined]
