@@ -1081,9 +1081,11 @@ class StorageManager:
         One pass reads the free bytes and the chunk size once. The predicate
         only compares those integers, so the queue lock is not held across
         another allocator query. A pass that starts nothing records the
-        smallest waiting prefix and returns. A later allocate walks the queue
-        only when that many bytes are still free.
+        smallest waiting prefix and returns. If that pass ends with at least
+        that many bytes still free, it walks once more. A later allocate or a
+        finished H2D walks the queue only when that many bytes are still free.
         """
+        retried_for_net_free = False
         while True:
             aligned = self._aligned_chunk_bytes()
             free = self._host_free_bytes() if aligned is not None else None
@@ -1127,6 +1129,16 @@ class StorageManager:
             hold = 0
             if aligned is not None and chunks is not None and chunks > 0:
                 hold = aligned * chunks
+            free_now = self._host_free_bytes() if hold > 0 else None
+            if (
+                not retried_for_net_free
+                and hold > 0
+                and free_now is not None
+                and free_now >= hold
+            ):
+                retried_for_net_free = True
+                self._tier_drain_again = False
+                continue
             with self._tier_bytes_lock():
                 self._tier_release_hold = hold
             self._tier_drain_again = False

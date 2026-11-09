@@ -713,6 +713,67 @@ def test_empty_drain_does_not_rescan_when_rearmed():
     assert manager.tier_queue.has_waiting() is True
 
 
+def test_empty_drain_takes_the_prefix_when_net_free_appears():
+    manager = _manager(True, _Backend(0))
+    manager._tier_release_hold = 0
+    manager._tier_drain_again = False
+    manager.tier_queue.note_lookup("r", 32, _load(8))
+    seen = {"n": 0}
+
+    def free():
+        seen["n"] += 1
+        return 50 if seen["n"] == 1 else 800
+
+    manager._aligned_chunk_bytes = lambda: 100
+    manager._host_free_bytes = free
+    launched: list[str] = []
+    manager._send_tier_ack = lambda *args, **kwargs: None
+    manager._launch_tier_get = lambda lookup_id, load: launched.append(lookup_id)
+    asyncio.run(manager._tier_drain_once())
+    assert launched == ["r"]
+    assert manager._tier_release_hold == 0
+    assert manager.tier_queue.is_reading("r") is True
+
+
+def test_empty_queue_does_not_retry_when_free_is_large():
+    manager = _manager(True, _Backend(0))
+    manager._tier_release_hold = 0
+    manager._tier_drain_again = False
+    passes = {"n": 0}
+    original = manager.tier_queue.take_next_fitting
+
+    def counting(fits):
+        passes["n"] += 1
+        return original(fits)
+
+    manager.tier_queue.take_next_fitting = counting
+    manager._aligned_chunk_bytes = lambda: 100
+    manager._host_free_bytes = lambda: 10_000
+    asyncio.run(manager._tier_drain_once())
+    assert passes["n"] == 1
+    assert manager._tier_release_hold == 0
+
+
+def test_net_free_retry_does_not_loop_when_nothing_can_start():
+    manager = _manager(True, _Backend(0))
+    manager._tier_release_hold = 0
+    manager._tier_drain_again = False
+    manager.tier_queue.note_lookup("r", 32, _load(8))
+    passes = {"n": 0}
+
+    def never(_fits):
+        passes["n"] += 1
+        return None
+
+    manager.tier_queue.take_next_fitting = never
+    manager._aligned_chunk_bytes = lambda: 100
+    manager._host_free_bytes = lambda: 800
+    asyncio.run(manager._tier_drain_once())
+    assert passes["n"] == 2
+    assert manager._tier_release_hold == 800
+    assert manager.tier_queue.has_waiting() is True
+
+
 def test_net_free_drains_only_when_the_prefix_still_fits():
     manager = _manager(True, _Backend(0))
     manager._tier_release_hold = 0

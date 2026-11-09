@@ -962,6 +962,8 @@ class LMCacheEngine:
                     memory_obj.unpin()
                 memory_obj.ref_count_down()
 
+        self._drain_after_host_return()
+
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(
             retrieve_stats,
@@ -1133,6 +1135,8 @@ class LMCacheEngine:
         for mem_obj in to_count_down:
             if mem_obj.is_pinned:
                 mem_obj.unpin()
+
+        self._drain_after_host_return()
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
@@ -1405,6 +1409,18 @@ class LMCacheEngine:
             self.storage_manager.loop,
         )
 
+    def _drain_after_host_return(self) -> None:
+        """Look at net free once after a prefetch body returns to the pool.
+
+        A disk GET pins a staging object that is not in the hot cache. Unpin
+        and ref_count_down hand those bytes back. One check covers the whole
+        prefix. Store eviction does not come through here.
+        """
+        storage = getattr(self, "storage_manager", None)
+        drain = getattr(storage, "_maybe_drain_on_net_free", None)
+        if callable(drain):
+            drain()
+
     def cleanup_memory_objs(self, lookup_id: str, epoch: int = 0) -> None:
         """
         Cleanup memory objects allocated during prefetch for an aborted lookup.
@@ -1452,6 +1468,7 @@ class LMCacheEngine:
                     memory_obj.ref_count_down()
                 except Exception as e:
                     logger.error("Error releasing memory object: %s", e)
+            self._drain_after_host_return()
         except Exception as e:
             logger.error(
                 "Error during cleanup_memory_objs for lookup_id=%s: %s",
