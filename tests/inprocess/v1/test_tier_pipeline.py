@@ -692,7 +692,6 @@ def test_stale_cleanup_does_not_cancel_a_newer_contains():
 
 def test_empty_drain_does_not_rescan_when_rearmed():
     manager = _manager(True, _Backend(0))
-    manager._tier_freed_since_scan = 0
     manager._tier_release_hold = 0
     manager._tier_drain_again = False
     manager.tier_queue.note_lookup("r", 32, _load(8))
@@ -711,13 +710,11 @@ def test_empty_drain_does_not_rescan_when_rearmed():
     assert passes["n"] == 1
     assert manager._tier_release_hold == 800
     assert manager._tier_drain_again is False
-    assert manager._tier_freed_since_scan == 0
     assert manager.tier_queue.has_waiting() is True
 
 
-def test_release_coalesces_until_the_smallest_prefix_fits():
+def test_net_free_drains_only_when_the_prefix_still_fits():
     manager = _manager(True, _Backend(0))
-    manager._tier_freed_since_scan = 0
     manager._tier_release_hold = 0
     manager._tier_drain_again = False
     manager.tier_queue.note_lookup("r", 32, _load(8))
@@ -733,32 +730,29 @@ def test_release_coalesces_until_the_smallest_prefix_fits():
         schedules["n"] += 1
         asyncio.run(manager._tier_drain_once())
 
-    manager._schedule_tier_drain = schedule
-    manager._note_host_released(100)
-    assert schedules["n"] == 1
+    asyncio.run(manager._tier_drain_once())
     assert manager._tier_release_hold == 800
-    assert manager._tier_freed_since_scan == 0
-    for _ in range(7):
-        manager._note_host_released(100)
-    assert schedules["n"] == 1
-    assert manager._tier_freed_since_scan == 700
+    assert launched == []
+    manager._schedule_tier_drain = schedule
+    for _ in range(8):
+        manager._maybe_drain_on_net_free()
+    assert schedules["n"] == 0
     free["n"] = 800
-    manager._note_host_released(100)
-    assert schedules["n"] == 2
+    manager._maybe_drain_on_net_free()
+    assert schedules["n"] == 1
     assert launched == ["r"]
     assert manager.tier_queue.is_reading("r") is True
 
 
 def test_new_lookup_drains_while_a_release_hold_is_set():
     manager = _manager(True, _Backend(0))
-    manager._tier_freed_since_scan = 0
     manager._tier_release_hold = 800
     manager._tier_drain_again = False
+    manager._host_free_bytes = lambda: 10
     schedules: list[str] = []
     manager._schedule_tier_drain = lambda: schedules.append("drain")
     manager.tier_queue.note_lookup("n", 4, _load(1))
     manager._schedule_tier_drain()
     assert schedules == ["drain"]
-    manager._note_host_released(10)
+    manager._maybe_drain_on_net_free()
     assert schedules == ["drain"]
-    assert manager._tier_freed_since_scan == 10
