@@ -48,12 +48,14 @@ from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
 from lmcache.inprocess.v1.tier_pipeline import (
+    admission_cancels_lookup,
     admission_tokens,
     detach_tier_schedule_bridge,
     forget_preempt,
     install_tier_schedule_bridge,
     metadata_lookup_expired,
     offer_waiting_lookups,
+    scheduler_hbm_has_free_block,
 )
 from lmcache.logging import init_logger
 from lmcache.utils import CacheStoreEvent, _lmcache_nvtx_annotate, cdiv
@@ -503,6 +505,9 @@ class LMCacheConnectorV1Impl:
         )
         if role == KVConnectorRole.SCHEDULER and self._split_metadata_lookup_enabled():
             self._tier_preempt_seen: dict[str, int] = {}
+            # False until a schedule pass reads free KV blocks. Unknown means
+            # not free, so a cold request is not reported as a miss.
+            self._tier_hbm_free = False
             self._install_tier_schedule_bridge()
 
     def _apply_extra_config(
@@ -1398,6 +1403,9 @@ class LMCacheConnectorV1Impl:
         """Start metadata lookup for waiting requests. Do not touch vLLM queues."""
         if not self._split_metadata_lookup_enabled():
             return
+        # One read per schedule pass. vLLM 0.33 exposes this on
+        # KVCacheManager.block_pool. Missing means not free.
+        self._tier_hbm_free = scheduler_hbm_has_free_block(scheduler)
         offer_waiting_lookups(
             scheduler,
             self.lookup_client,
@@ -1482,10 +1490,12 @@ class LMCacheConnectorV1Impl:
             return 0
 
         if self._split_metadata_lookup_enabled():
-            # Lookup was offered when the request entered the waiting queue.
-            # This call only reads that result. Pending is not a miss.
-            # A metadata ACK that never arrives becomes a miss. A hit that is
-            # still waiting for host memory stays None.
+            # Lookup was offered at the start of this schedule pass. The ACK
+            # has not arrived yet, so the phase is still pending. A body that
+            # is already in host is admitted. With no preloaded request and a
+            # free KV block, pending, queued, and absent are a miss so the GPU
+            # recomputes. Otherwise they stay None. A metadata ACK that never
+            # arrives still becomes a miss after lookup_timeout_ms.
             phase = self.lookup_client.lookup_phase(req_id)
             offered_at = self.lookup_client.lookup_offered_at(req_id)
             if metadata_lookup_expired(
@@ -1496,10 +1506,17 @@ class LMCacheConnectorV1Impl:
             ):
                 self.lookup_client.cancel_lookup(req_id)
                 return 0
+            admission = getattr(self.lookup_client, "tier_admission", None)
+            has_ready = getattr(admission, "has_ready", None)
+            any_ready = bool(has_ready()) if callable(has_ready) else False
             admitted = admission_tokens(
-                self.lookup_client.lookup_phase(req_id),
+                phase,
                 self.lookup_client.preloaded_tokens(req_id),
+                any_ready=any_ready,
+                hbm_free=bool(getattr(self, "_tier_hbm_free", False)),
             )
+            if admission_cancels_lookup(phase, admitted):
+                self.lookup_client.cancel_lookup(req_id)
             if admitted is None:
                 return None
             num_external_hit_tokens = admitted

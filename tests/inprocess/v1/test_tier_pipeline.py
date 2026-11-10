@@ -21,6 +21,7 @@ from lmcache.inprocess.v1.tier_pipeline import (
     TierAdmission,
     TierLoad,
     TierWorkerQueue,
+    admission_cancels_lookup,
     admission_tokens,
     completion_kind,
     detach_tier_schedule_bridge,
@@ -28,6 +29,7 @@ from lmcache.inprocess.v1.tier_pipeline import (
     install_tier_schedule_bridge,
     metadata_lookup_expired,
     offer_waiting_lookups,
+    scheduler_hbm_has_free_block,
 )
 
 
@@ -63,31 +65,100 @@ def test_lookup_response_kind_defaults_empty():
 
 def test_admission_pending_is_not_a_miss_and_ready_is_positive():
     admission = TierAdmission()
-    assert admission_tokens(admission.phase("r"), 0) is None
+    # No free KV block: a cold request stays waiting.
+    assert admission_tokens(admission.phase("r"), 0, hbm_free=False) is None
+    # Nothing is preloaded and HBM has a free block: recompute.
+    assert admission_tokens(admission.phase("r"), 0, hbm_free=True) == 0
+    assert admission_cancels_lookup(PHASE_ABSENT, 0) is False
 
     assert admission.offer("r") is True
     assert admission.offer("r") is False
     assert admission.phase("r") == PHASE_PENDING
-    assert admission_tokens(admission.phase("r"), 0) is None
+    assert admission.has_ready() is False
+    assert admission_tokens(admission.phase("r"), 0, hbm_free=False) is None
+    assert (
+        admission_tokens(admission.phase("r"), 0, any_ready=False, hbm_free=True) == 0
+    )
+    assert admission_cancels_lookup(PHASE_PENDING, 0) is True
 
-    # Metadata hit only. The lookup window is free, HBM admission still waits.
+    # Metadata hit only. The body is not in host yet.
     admission.note("r", "lookup", 128)
     assert admission.phase("r") == PHASE_QUEUED
     assert admission.inflight() == 0
-    tokens = admission_tokens(admission.phase("r"), admission.preloaded_tokens("r"))
+    assert admission.has_ready() is False
+    tokens = admission_tokens(
+        admission.phase("r"), admission.preloaded_tokens("r"), hbm_free=False
+    )
     assert tokens is None
+    assert (
+        admission_tokens(
+            admission.phase("r"),
+            admission.preloaded_tokens("r"),
+            any_ready=False,
+            hbm_free=True,
+        )
+        == 0
+    )
+    assert admission_cancels_lookup(PHASE_QUEUED, 0) is True
+
+    # Another request is already in host. This one waits so those blocks
+    # are used to load that prefix.
+    assert admission.offer("other") is True
+    admission.note("other", "preloaded", 64)
+    assert admission.has_ready() is True
+    assert (
+        admission_tokens(
+            admission.phase("r"),
+            0,
+            any_ready=True,
+            hbm_free=True,
+        )
+        is None
+    )
 
     admission.note("r", "reading", 0)
     assert admission.phase("r") == PHASE_QUEUED
 
     admission.note("r", "preloaded", 128)
     assert admission.phase("r") == PHASE_READY
-    tokens = admission_tokens(admission.phase("r"), admission.preloaded_tokens("r"))
+    tokens = admission_tokens(
+        admission.phase("r"),
+        admission.preloaded_tokens("r"),
+        any_ready=True,
+        hbm_free=True,
+    )
     assert tokens == 128
+    assert admission_cancels_lookup(PHASE_READY, tokens) is False
 
     # A later ACK does not change a finished hit.
     admission.note("r", "lookup", 0)
     assert admission.phase("r") == PHASE_READY
+
+
+def test_scheduler_hbm_free_block_uses_vllm_033_pool():
+    assert scheduler_hbm_has_free_block(SimpleNamespace()) is False
+    missing = SimpleNamespace(kv_cache_manager=SimpleNamespace())
+    assert scheduler_hbm_has_free_block(missing) is False
+
+    def boom():
+        raise RuntimeError("pool")
+
+    broken = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            block_pool=SimpleNamespace(get_num_free_blocks=boom)
+        )
+    )
+    assert scheduler_hbm_has_free_block(broken) is False
+
+    def blocks(n):
+        return SimpleNamespace(
+            kv_cache_manager=SimpleNamespace(
+                block_pool=SimpleNamespace(get_num_free_blocks=lambda: n)
+            )
+        )
+
+    assert scheduler_hbm_has_free_block(blocks(0)) is False
+    assert scheduler_hbm_has_free_block(blocks(3)) is True
 
 
 def test_admission_lookup_zero_is_a_miss():

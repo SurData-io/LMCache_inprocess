@@ -29,21 +29,61 @@ PHASE_MISS = "miss"
 PHASE_READY = "ready"
 
 
-def admission_tokens(phase: str, preloaded: int) -> Optional[int]:
+def admission_tokens(
+    phase: str,
+    preloaded: int,
+    *,
+    any_ready: bool = False,
+    hbm_free: bool = False,
+) -> Optional[int]:
     """What ``get_num_new_matched_tokens`` may report. It does not start I/O.
 
-    Pending, queued, and absent stay ``None`` so vLLM leaves the request in
-    ``skipped_waiting``. Queued means the hit length is known and the body is
-    not in host yet; that wait is not a miss. A confirmed miss is ``0``. A
-    positive length is returned only after the body is in host memory.
+    A positive length is returned only after the body is in host memory.
+    A confirmed miss is ``0``. Absent, pending, and queued are also ``0``
+    when this schedule pass has no preloaded request and HBM still has a
+    free KV block, so vLLM recomputes instead of idling. They stay ``None``
+    when another request is already preloaded, or when HBM has no free
+    block: a ``0`` then would commit a miss the GPU cannot run, or would
+    take the free blocks from a prefix that is already in host.
     """
-    if phase in (PHASE_ABSENT, PHASE_PENDING, PHASE_QUEUED):
-        return None
     if phase == PHASE_MISS:
         return 0
     if phase == PHASE_READY:
         return max(0, int(preloaded))
+    if phase in (PHASE_ABSENT, PHASE_PENDING, PHASE_QUEUED):
+        if (not any_ready) and hbm_free:
+            return 0
+        return None
     return None
+
+
+def admission_cancels_lookup(phase: str, admitted: Optional[int]) -> bool:
+    """True when a forced miss must drop a lookup that was already offered.
+
+    Absent has no worker GET and no ACK. Pending and queued do: cancel so a
+    late ACK cannot move the phase off the miss just reported.
+    """
+    return admitted == 0 and phase in (PHASE_PENDING, PHASE_QUEUED)
+
+
+def scheduler_hbm_has_free_block(scheduler: Any) -> bool:
+    """True when vLLM 0.33 still has a free KV block.
+
+    ``KVCacheManager.block_pool.get_num_free_blocks`` is the accessor on
+    v0.33.0 (``scheduler.kv_cache_manager.block_pool``). A missing attribute
+    or a failed call means not free, so admission keeps waiting.
+    """
+    manager = getattr(scheduler, "kv_cache_manager", None)
+    pool = getattr(manager, "block_pool", None) if manager is not None else None
+    free_blocks = (
+        getattr(pool, "get_num_free_blocks", None) if pool is not None else None
+    )
+    if not callable(free_blocks):
+        return False
+    try:
+        return int(free_blocks()) > 0
+    except Exception:
+        return False
 
 
 def metadata_lookup_expired(
@@ -294,6 +334,11 @@ class TierAdmission:
         """Hits whose body is not in host memory yet. These hold prefix pins."""
         with self._lock:
             return sum(1 for phase in self._phase.values() if phase == PHASE_QUEUED)
+
+    def has_ready(self) -> bool:
+        """True when some request's body is already in host memory."""
+        with self._lock:
+            return any(phase == PHASE_READY for phase in self._phase.values())
 
     def clear(self, req_id: str) -> None:
         key = str(req_id)
