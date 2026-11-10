@@ -48,6 +48,7 @@ from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (
+    aligned_savable_tokens,
     chunks_for_save_batch,
 )
 from lmcache.inprocess.v1.tier_pipeline import (
@@ -1051,32 +1052,58 @@ class LMCacheConnectorV1Impl:
             if skip >= len(token_ids):
                 return 0
             skip = skip // chunk_size * chunk_size
-        savable = len(token_ids) - skip
-        if savable <= 0:
+        slot_mapping = getattr(request, "slot_mapping", None)
+        slot_count = None if slot_mapping is None else len(slot_mapping)
+        # Layerwise save does not cut a non-final prefill. The non-layerwise
+        # path does, unless blending is on. Either way the count below is a
+        # whole number of chunks: the partial tail is not rounded up.
+        return aligned_savable_tokens(
+            len(token_ids),
+            skip,
+            chunk_size,
+            last_prefill=True if layerwise else bool(request.is_last_prefill),
+            blending=bool(self.enable_blending) and not layerwise,
+            slot_count=slot_count,
+        )
+
+    def _aligned_slots_for_save(self, request: ReqMeta, *, layerwise: bool) -> int:
+        """Aligned chunks this request will allocate. Layerwise multiplies by layers."""
+        tokens = self._savable_tokens_for_save(request, layerwise=layerwise)
+        chunk_size = self._lmcache_chunk_size
+        if chunk_size <= 0 or tokens <= 0:
             return 0
-        return savable
+        slots = tokens // chunk_size
+        if layerwise:
+            slots *= max(int(self.num_layers), 1)
+        return slots
 
     def _pre_evict_save_batch(
         self,
         requests: list[ReqMeta],
         *,
         layerwise: bool,
-    ) -> None:
-        """Drop hot-cache chunks for this batch before any per-chunk allocate."""
+    ) -> int:
+        """Evict what fits, and return how many aligned slots are free afterwards.
+
+        The caller skips a request that still does not fit. Zero means the
+        free list could not be seen, or nothing is free.
+        """
         engine = self.lmcache_engine
         if engine is None:
-            return
+            return 0
         pre_evict = getattr(engine, "pre_evict_for_save", None)
         if not callable(pre_evict):
-            return
+            return 0
         savable = [
             self._savable_tokens_for_save(request, layerwise=layerwise)
             for request in requests
         ]
         num_chunks = chunks_for_save_batch(savable, self._lmcache_chunk_size)
         if num_chunks <= 0:
-            return
-        pre_evict(num_chunks)
+            return 0
+        if layerwise:
+            num_chunks *= max(int(self.num_layers), 1)
+        return int(pre_evict(num_chunks))
 
     @_lmcache_nvtx_annotate
     def save_kv_layer(
@@ -1119,13 +1146,20 @@ class LMCacheConnectorV1Impl:
         kvcaches = list(self.kv_caches.values())
         is_first = True
 
-        # store_layer allocates on the first visit. Later layers only advance
-        # the generator, so the hot cache is trimmed once per batch.
-        if any(
+        # store_layer allocates on the first visit. Unpin first so lookup
+        # pins do not hide evictable chunks, then keep only requests that
+        # fit in the slots that eviction could actually free.
+        first_pass = any(
             self._layerwise_save_storers.get(request.req_id) is None
             for request in connector_metadata.requests
-        ):
-            self._pre_evict_save_batch(connector_metadata.requests, layerwise=True)
+        )
+        free_slots = 0
+        if first_pass:
+            for request in connector_metadata.requests:
+                self.lmcache_engine.lookup_unpin(request.req_id)
+            free_slots = self._pre_evict_save_batch(
+                connector_metadata.requests, layerwise=True
+            )
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1136,6 +1170,20 @@ class LMCacheConnectorV1Impl:
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
             if layerwise_storer is None:
+                if not first_pass:
+                    continue
+                slots = self._aligned_slots_for_save(request, layerwise=True)
+                if slots <= 0 or slots > free_slots:
+                    if slots > free_slots:
+                        logger.info(
+                            "Dropping KV for request %s: need %d aligned slots, "
+                            "%d free; skipping D2H",
+                            request.req_id,
+                            slots,
+                            free_slots,
+                        )
+                    continue
+                free_slots -= slots
                 token_ids = request.token_ids
                 assert isinstance(token_ids, list)
 
@@ -1183,6 +1231,7 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    drop_on_alloc_miss=True,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -1232,14 +1281,15 @@ class LMCacheConnectorV1Impl:
         # Probe decoder cache before store if bidirectional mode is enabled
         bidir_enabled = getattr(self.config, "pd_bidirectional", False)
 
-        # Free one batch of hot-cache slots before the per-request store loop
-        # starts failing allocations and evicting a single chunk at a time.
-        self._pre_evict_save_batch(connector_metadata.requests, layerwise=False)
+        # Unpin the whole batch before eviction. Async lookup pins would
+        # otherwise make can_evict false and the pass would free nothing.
+        for request in connector_metadata.requests:
+            self.lmcache_engine.lookup_unpin(request.req_id)
+        free_slots = self._pre_evict_save_batch(
+            connector_metadata.requests, layerwise=False
+        )
 
         for request in connector_metadata.requests:
-            # unpin the kv caches according to req_id
-            self.lmcache_engine.lookup_unpin(request.req_id)
-
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
@@ -1293,6 +1343,20 @@ class LMCacheConnectorV1Impl:
                 request.req_id,
             )
 
+            slots = self._aligned_slots_for_save(request, layerwise=False)
+            if slots <= 0:
+                continue
+            if slots > free_slots:
+                logger.info(
+                    "Dropping KV for request %s: need %d aligned slots, "
+                    "%d free; skipping D2H",
+                    request.req_id,
+                    slots,
+                    free_slots,
+                )
+                continue
+            free_slots -= slots
+
             is_last_prefill = request.is_last_prefill
             if is_last_prefill:
                 if request.disagg_spec:
@@ -1327,6 +1391,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+                drop_on_alloc_miss=True,
             )
 
             # Probe decoder cache after store

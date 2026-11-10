@@ -385,12 +385,13 @@ class LMCacheEngine:
     def pre_evict_for_save(self, num_chunks: int) -> int:
         """Free local-CPU hot-cache slots before this step's stores allocate.
 
-        ``num_chunks`` is the batch upper bound computed by the vLLM worker
-        from the requests it is about to save. The per-chunk allocate loop in
-        ``store`` is unchanged: if this pass cannot free enough, that loop
-        still evicts one chunk at a time. Returns how many chunks were evicted.
+        ``num_chunks`` is the aligned slot demand of the batch. Eviction is
+        best-effort: pinned and in-flight objects stay. Returns how many
+        aligned slots are free afterwards, which may be less than the demand.
+        A caller that still cannot fit one request skips that store and does
+        not copy KV off the GPU.
         """
-        if num_chunks <= 0 or self.storage_manager is None:
+        if self.storage_manager is None:
             return 0
         backend = self.storage_manager.allocator_backend
         ensure = getattr(backend, "ensure_free_chunks", None)
@@ -444,6 +445,11 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        # The vLLM save path sets this after it has already counted aligned
+        # free slots. A failed allocate releases what this call already took
+        # and returns before any GPU-to-CPU copy. Other callers keep the
+        # partial-store behaviour.
+        drop_on_alloc_miss = bool(kwargs.pop("drop_on_alloc_miss", False))
 
         # Initialize num_to_store_tokens to avoid reference before assignment
         num_to_store_tokens = 0
@@ -525,12 +531,23 @@ class LMCacheEngine:
                 memory_obj = self.storage_manager.allocate(
                     kv_shapes,
                     kv_dtypes,
-                    busy_loop=self.config.get_extra_config_value(
-                        "force_store_wait", False
-                    ),
+                    eviction=not drop_on_alloc_miss,
+                    busy_loop=False
+                    if drop_on_alloc_miss
+                    else self.config.get_extra_config_value("force_store_wait", False),
                     fmt=self.fmt,
                 )
                 if memory_obj is None:
+                    if drop_on_alloc_miss:
+                        for held in memory_objs:
+                            held.ref_count_down()
+                        logger.warning(
+                            "Dropping KV for request %s before D2H; "
+                            "allocated %d chunks and the next one did not fit.",
+                            req_id,
+                            len(memory_objs),
+                        )
+                        return
                     logger.warning(
                         "Local cpu memory under pressure so"
                         " choosing to store only "
@@ -654,6 +671,7 @@ class LMCacheEngine:
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
+        drop_on_alloc_miss = bool(kwargs.pop("drop_on_alloc_miss", False))
 
         if mask is not None:
             num_to_store_tokens = torch.sum(mask).item()
@@ -723,10 +741,25 @@ class LMCacheEngine:
                 kv_dtype,
                 batch_size=self.num_layers,
                 fmt=self.fmt,
-                busy_loop=self.config.get_extra_config_value("force_store_wait", False),
+                eviction=not drop_on_alloc_miss,
+                busy_loop=False
+                if drop_on_alloc_miss
+                else self.config.get_extra_config_value("force_store_wait", False),
             )
 
             if memory_objs_multi_layer is None:
+                if drop_on_alloc_miss:
+                    for layer_objs in memory_objs:
+                        for held in layer_objs:
+                            held.ref_count_down()
+                    memory_objs = []
+                    keys = []
+                    logger.warning(
+                        "Dropping layerwise KV for request %s before D2H; "
+                        "the next chunk did not fit.",
+                        req_id,
+                    )
+                    break
                 logger.warning(
                     "Local cpu memory under pressure so"
                     " choosing to not store the KV cache."

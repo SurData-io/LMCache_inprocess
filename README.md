@@ -1,18 +1,32 @@
 # LMCache InProcess
 
+## 2026-11-11 对齐预算，腾不够就丢掉 KV
+
+预算和空闲槽都按对齐后的整块算。`aligned_savable_tokens` 与 `wait_for_save` 的实际写入对齐：`slot_mapping` 和 token 长度不一致算 0；`skip_leading_tokens` 向下对齐到 `chunk_size`；不是最后一段 prefill 且没开 blending 时，结尾也向下对齐。块数是 `savable // chunk_size`，尾巴不再 `ceil`。layerwise 一条 chunk 要 `num_layers` 个对象，槽位按这个倍数算，token 块数仍钳到 32。
+
+空闲槽用 `get_full_chunk_size_bytes()`（没有 metadata 时用已在池里的对象物理大小）再按 allocator 的 `align_bytes` 向上对齐。地址空闲链表里每个连续块贡献 `size // aligned`，小于一块的碎片算 0。`ensure_free_chunks` 只驱逐差额，一次 `batched_remove(force=False)`，pin 住的和在飞落盘不动，也不 sleep。返回值是驱逐之后的对齐空闲槽数。看不到空闲链表时返回 0。
+
+`wait_for_save` 先对整批 `lookup_unpin`，再预驱逐，再按请求扣槽。一条请求的块数大于剩余槽就打日志并跳过 `store`，不做 D2H。`save_kv_layer` 在第一次建 storer 之前同样先 unpin 再算槽，不够就不建 `store_layer`。`kv_consumer` 只 unpin、不存。这条路径的 `store` / `store_layer` 带 `drop_on_alloc_miss`：分配失败时把已经拿到的对象 `ref_count_down`，在 `batched_from_gpu` 之前返回，不再「失败一次、驱逐一个、再分配」。没有新配置项，`reserve_local_cpu_size` 和 SurData 直连池没有改。
+
+### 已完成
+- 预算按 chunk 对齐整除。空闲槽按对齐后的连续空闲块计数。腾不够就丢这条请求的 KV，不做 D2H。
+- 本机用 venv 的 torch 跑了 `tests/inprocess/v1/test_local_cpu_pre_evict.py`：7 项通过。覆盖对齐块数、碎片算 0、腾不出预算时返回的空闲槽小于预算、看不到空闲链表时返回 0。没有跑 800×2。
+
+### 尚未完成
+- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。
+
 ## 2026-11-11 batch 组建后预驱逐 20GiB local CPU 池
 
 `store` 逐 chunk 调用 `allocate`。20GiB pinned 池写满后，每次分配先失败再从 hot cache 驱逐 1 个，这段耗时记在 `offload_time` 里。`20261110-222612` 的后半段 offload 中位从 9.7 ms 升到 52.6 ms。落盘的 `put_time` 中位仍是 0.56 ms。
 
-worker 在 `wait_for_save` 和 layerwise 的 `save_kv_layer` 进入逐请求循环之前，按本批还要写的 token 数算 chunk 上限，`ceil(token / chunk_size)` 求和后钳到 32（`max_num_batched_tokens / chunk_size = 8192 / 256`）。`LocalCPUBackend.ensure_free_chunks` 只补差额：已经空着的整块不动，pin 住的和还在写盘的项不驱逐。不够时不 sleep，原来的逐 chunk 驱逐还在。没有新配置项，`reserve_local_cpu_size` 和 SurData 直连池没有改。
+上一节把「不够就退回逐 chunk 驱逐」改成了「腾不够就丢掉这条 KV」。这里留下当时的做法，方便对照。
 
 ### 已完成
 - `chunks_for_save_batch`、`ensure_free_chunks`、`LMCacheEngine.pre_evict_for_save`。
 - `wait_for_save` 在非 layerwise 的 store 循环前调用一次。`save_kv_layer` 只在还没建过 layerwise storer 时调用一次。`kv_consumer` 和 engine 未初始化的分支不调用。
-- 本机用 venv 的 torch 跑了 `tests/inprocess/v1/test_local_cpu_pre_evict.py`：4 项通过。覆盖 batch 上限钳位、池满后一次腾出 8 块且随后分配不再打 `Failed to allocate`、pin 住的项留下、已经有空槽时不驱逐。没有跑 800×2。
 
 ### 尚未完成
-- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。`get_size_bytes` 改成 allocator 初始化时再导入，避免 store 预驱逐这条导入链去拉 vLLM KV format 注册表。
+- 没有把预驱逐打进 GPU 镜像，也没有复测 800×2。`get_size_bytes` 改成 allocator 初始化时再导入，避免 store 预驱逐这条导入链去拉 vLLM KV format 注册表。
 
 ## 2026-11-10 没有 preloaded 且 HBM 有空就报 miss
 

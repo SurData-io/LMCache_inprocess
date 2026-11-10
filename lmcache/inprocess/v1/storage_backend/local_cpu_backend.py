@@ -46,17 +46,48 @@ logger = init_logger(__name__)
 STORE_PREEVICT_CHUNK_CAP = 32
 
 
+def aligned_savable_tokens(
+    token_count: int,
+    skip_leading_tokens: int,
+    chunk_size: int,
+    *,
+    last_prefill: bool,
+    blending: bool,
+    slot_count: Optional[int] = None,
+) -> int:
+    """Tokens that will actually be stored, both ends on a chunk boundary.
+
+    A slot-mapping length that does not match the tokens stores nothing.
+    The already-saved prefix is aligned down. A non-final prefill without
+    blending also drops the tail that does not fill a chunk. The partial
+    tail is never rounded up into an extra chunk.
+    """
+    if chunk_size <= 0 or token_count <= 0:
+        return 0
+    if slot_count is not None and int(slot_count) != int(token_count):
+        return 0
+    if skip_leading_tokens >= token_count:
+        return 0
+    skip = (int(skip_leading_tokens) // chunk_size) * chunk_size
+    end = int(token_count)
+    if not last_prefill and not blending:
+        end = (end // chunk_size) * chunk_size
+    savable = end - skip
+    if savable <= 0:
+        return 0
+    return (savable // chunk_size) * chunk_size
+
+
 def chunks_for_save_batch(
     savable_tokens: list[int],
     chunk_size: int,
     cap: int = STORE_PREEVICT_CHUNK_CAP,
 ) -> int:
-    """Chunk upper bound for one store batch.
+    """Chunk count for one store batch.
 
-    ``savable_tokens`` is how many tokens each request in the batch still
-    has to write. The result is the sum of per-request chunk counts, clamped
-    to ``cap`` so a batch cannot ask the hot cache to drop more than one
-    engine step of KV.
+    ``savable_tokens`` is the aligned token count of each request. Partial
+    tails count as zero chunks. The sum is clamped to ``cap`` so one batch
+    cannot ask for more than one engine step.
     """
     if chunk_size <= 0 or cap <= 0:
         return 0
@@ -64,10 +95,37 @@ def chunks_for_save_batch(
     for count in savable_tokens:
         if count <= 0:
             continue
-        total += (int(count) + chunk_size - 1) // chunk_size
+        total += int(count) // chunk_size
         if total >= cap:
             return cap
     return total
+
+
+def aligned_slot_bytes(chunk_bytes: int, align_bytes: int) -> int:
+    """Round a chunk up to the allocator alignment. Zero when either is invalid."""
+    if chunk_bytes <= 0:
+        return 0
+    align = int(align_bytes) if align_bytes else 1
+    if align <= 0:
+        align = 1
+    return ((int(chunk_bytes) + align - 1) // align) * align
+
+
+def aligned_free_slot_count(free_blocks, aligned_bytes: int) -> int:
+    """How many aligned chunks fit in the free address list.
+
+    Each contiguous free block contributes ``size // aligned_bytes``. A
+    fragment smaller than one aligned chunk contributes nothing, so a large
+    total of tiny holes is not treated as free capacity.
+    """
+    if aligned_bytes <= 0:
+        return 0
+    slots = 0
+    for block in free_blocks:
+        size = int(getattr(block, "size", 0) or 0)
+        if size >= aligned_bytes:
+            slots += size // aligned_bytes
+    return slots
 
 
 def _chunk_size_bytes(shapes, dtypes) -> int:
@@ -803,50 +861,70 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 return size
         return None
 
-    def _free_chunk_slots(self, chunk_bytes: int) -> Optional[int]:
-        """How many chunk-sized blocks the pinned allocator can still hand out.
-
-        ``None`` means the allocator does not expose a free-byte count. The
-        caller then treats the pool as full and evicts the whole request.
-        """
-        if chunk_bytes <= 0:
+    def _aligned_slot_bytes(self) -> Optional[int]:
+        """One store slot, rounded up to the pinned allocator alignment."""
+        chunk_bytes: Optional[int] = None
+        if self.metadata is not None:
+            try:
+                chunk_bytes = int(self.get_full_chunk_size_bytes())
+            except Exception:
+                chunk_bytes = None
+        if chunk_bytes is None or chunk_bytes <= 0:
+            chunk_bytes = self._store_chunk_bytes()
+        if chunk_bytes is None or chunk_bytes <= 0:
             return None
         allocator = self.memory_allocator
         pin = getattr(allocator, "pin_allocator", allocator)
         address_manager = getattr(pin, "address_manager", None)
-        free_size = getattr(address_manager, "get_free_size", None)
-        if not callable(free_size):
+        align = getattr(allocator, "align_bytes", None)
+        if not align:
+            align = getattr(pin, "align_bytes", None)
+        if not align and address_manager is not None:
+            align = getattr(address_manager, "_align", None)
+        return aligned_slot_bytes(chunk_bytes, int(align or 1))
+
+    def _aligned_free_slots(self, aligned_bytes: int) -> Optional[int]:
+        """Aligned chunks that fit in contiguous free address blocks.
+
+        ``None`` means the allocator does not expose its free list. Callers
+        treat that as no room and skip the D2H.
+        """
+        if aligned_bytes <= 0:
             return None
-        try:
-            free_bytes = int(free_size())
-        except Exception:
+        allocator = self.memory_allocator
+        pin = getattr(allocator, "pin_allocator", allocator)
+        address_manager = getattr(pin, "address_manager", None)
+        free_blocks = getattr(address_manager, "_explicit_list", None)
+        if free_blocks is None:
             return None
-        if free_bytes < 0:
-            return None
-        return free_bytes // chunk_bytes
+        lock = getattr(address_manager, "_lock", None)
+        if lock is None:
+            return aligned_free_slot_count(free_blocks, aligned_bytes)
+        with lock:
+            return aligned_free_slot_count(free_blocks, aligned_bytes)
 
     @_lmcache_nvtx_annotate
     def ensure_free_chunks(self, num_chunks: int) -> int:
-        """Evict hot-cache chunks so a coming store can allocate without retrying.
+        """Evict what the hot cache can spare, then report aligned free slots.
 
-        ``num_chunks`` is the batch upper bound. Slots that are already free
-        are kept, and only the shortfall is dropped, in one pass. Pinned
-        objects and in-flight disk writes (``can_evict`` is false) stay.
-        Returns how many chunks were actually evicted. A shortfall does not
-        sleep or spin; the store path still evicts one chunk at a time if
-        this pass cannot free enough.
+        ``num_chunks`` is the batch's aligned slot demand. Already-free
+        aligned slots are kept. Only the shortfall is dropped, and only from
+        objects ``can_evict`` allows. Pinned objects and in-flight disk
+        writes stay. Returns how many aligned slots are free after that
+        pass, which may be less than ``num_chunks``. No sleep and no
+        per-chunk retry. A missing free list returns 0.
         """
-        if num_chunks <= 0 or not self.use_hot:
+        if not self.use_hot:
             return 0
-
-        chunk_bytes = self._store_chunk_bytes()
-        free_slots = None if chunk_bytes is None else self._free_chunk_slots(chunk_bytes)
+        aligned_bytes = self._aligned_slot_bytes()
+        if aligned_bytes is None:
+            return 0
+        free_slots = self._aligned_free_slots(aligned_bytes)
         if free_slots is None:
-            need = num_chunks
-        else:
-            need = num_chunks - free_slots
-        if need <= 0:
             return 0
+        need = num_chunks - free_slots
+        if need <= 0:
+            return free_slots
 
         evicted = 0
         with self.cpu_lock:
@@ -871,11 +949,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if evicted:
             self.stats_monitor.update_local_cpu_evict_metrics(evicted)
             logger.debug(
-                "Pre-evicted %d chunks from local cpu hot cache for a %d chunk store",
+                "Pre-evicted %d chunks from local cpu hot cache for a %d slot store",
                 evicted,
                 num_chunks,
             )
-        return evicted
+        free_after = self._aligned_free_slots(aligned_bytes)
+        if free_after is None:
+            return 0
+        return free_after
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
