@@ -1,5 +1,19 @@
 # LMCache InProcess
 
+## 2026-11-11 batch 组建后预驱逐 20GiB local CPU 池
+
+`store` 逐 chunk 调用 `allocate`。20GiB pinned 池写满后，每次分配先失败再从 hot cache 驱逐 1 个，这段耗时记在 `offload_time` 里。`20261110-222612` 的后半段 offload 中位从 9.7 ms 升到 52.6 ms。落盘的 `put_time` 中位仍是 0.56 ms。
+
+worker 在 `wait_for_save` 和 layerwise 的 `save_kv_layer` 进入逐请求循环之前，按本批还要写的 token 数算 chunk 上限，`ceil(token / chunk_size)` 求和后钳到 32（`max_num_batched_tokens / chunk_size = 8192 / 256`）。`LocalCPUBackend.ensure_free_chunks` 只补差额：已经空着的整块不动，pin 住的和还在写盘的项不驱逐。不够时不 sleep，原来的逐 chunk 驱逐还在。没有新配置项，`reserve_local_cpu_size` 和 SurData 直连池没有改。
+
+### 已完成
+- `chunks_for_save_batch`、`ensure_free_chunks`、`LMCacheEngine.pre_evict_for_save`。
+- `wait_for_save` 在非 layerwise 的 store 循环前调用一次。`save_kv_layer` 只在还没建过 layerwise storer 时调用一次。`kv_consumer` 和 engine 未初始化的分支不调用。
+- 本机用 venv 的 torch 跑了 `tests/inprocess/v1/test_local_cpu_pre_evict.py`：4 项通过。覆盖 batch 上限钳位、池满后一次腾出 8 块且随后分配不再打 `Failed to allocate`、pin 住的项留下、已经有空槽时不驱逐。没有跑 800×2。
+
+### 尚未完成
+- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。`get_size_bytes` 改成 allocator 初始化时再导入，避免 store 预驱逐这条导入链去拉 vLLM KV format 注册表。
+
 ## 2026-11-10 没有 preloaded 且 HBM 有空就报 miss
 
 调度器侧 `TierAdmission` 相位是 `ready` 时，`get_num_new_matched_tokens` 仍返回 host 里已经有的 token 数，vLLM 按原路径把这段 KV 拷进 HBM。这一轮没有任何 `ready`，并且 vLLM 0.33 的 `scheduler.kv_cache_manager.block_pool.get_num_free_blocks()` 大于 0 时，`absent`、`pending`、`queued` 返回 `0`，GPU 重算。已经有别的 `ready`，或者读不到空闲块、空闲块是 0，这三种相位仍返回 `None`。`pending` 和 `queued` 被报成 miss 时调用已有的 `cancel_lookup`，迟到的 ACK 不能把相位改回去。
@@ -10,8 +24,7 @@
 - 本机没有 `pytest` 和 `lmcache_native`。用导入替身跑了 `tests/inprocess/v1/test_tier_pipeline.py`：34 项里 17 项因缺少 `lmcache.lmcache_native` 跳过，其余 17 项通过，其中包括新的空 HBM 报 miss 和空闲块读取。没有跑 800×2。host 池大小没有改。
 
 ### 尚未完成
-- 没有在 GPU 上复测 800×2，所以还不知道第一轮那 21.9 秒有没有缩短。
-- 镜像里没有装这个源。要进下一轮 bench 得先打进 `vllm-openai:v0.33.0-lmcache0.5.7-pr9` 那条镜像。
+- 2026-11-10 22:26 复测，戳 `20261110-222612`。镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-3c3398a`，两个开关都开，盘是 `/mnt/xfs` 上的 XFS（`/mnt/xfs/surdata-xfs/native/kvcache`）。综合 408.5 tok/s = (51170+35114)/211.217。Turn1 163.82s，4.88 req/s，312.36 tok/s，51170 token，TTFT 均/中/P99 60744.88/53040.20/140117.97 ms。Turn2 47.40s，16.88 req/s，740.85 tok/s，35114 token，TTFT 96373.70/93858.72/129239.64 ms。`wall_s=211.217`，重叠 196.501s。两轮都是 800 成功、0 失败。`EXIT_RC=0`。比 `64a2a5d` 的 566.5 和原生 XFS 的 656.1 都低。没有推送。
 
 
 

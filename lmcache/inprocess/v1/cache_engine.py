@@ -382,6 +382,22 @@ class LMCacheEngine:
             return self.storage_manager.is_hot_cache_enabled()
         return False
 
+    def pre_evict_for_save(self, num_chunks: int) -> int:
+        """Free local-CPU hot-cache slots before this step's stores allocate.
+
+        ``num_chunks`` is the batch upper bound computed by the vLLM worker
+        from the requests it is about to save. The per-chunk allocate loop in
+        ``store`` is unchanged: if this pass cannot free enough, that loop
+        still evicts one chunk at a time. Returns how many chunks were evicted.
+        """
+        if num_chunks <= 0 or self.storage_manager is None:
+            return 0
+        backend = self.storage_manager.allocator_backend
+        ensure = getattr(backend, "ensure_free_chunks", None)
+        if not callable(ensure):
+            return 0
+        return int(ensure(num_chunks))
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
     def store(

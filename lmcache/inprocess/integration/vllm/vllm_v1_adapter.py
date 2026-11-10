@@ -47,6 +47,9 @@ from lmcache.inprocess.v1.compute.blend import LMCBlenderBuilder
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.config_base import validate_and_set_config_value
 from lmcache.inprocess.v1.manager import LMCacheManager
+from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (
+    chunks_for_save_batch,
+)
 from lmcache.inprocess.v1.tier_pipeline import (
     admission_cancels_lookup,
     admission_tokens,
@@ -1015,6 +1018,66 @@ class LMCacheConnectorV1Impl:
 
         return
 
+    def _savable_tokens_for_save(self, request: ReqMeta, *, layerwise: bool) -> int:
+        """Tokens this request will still write on the coming store call.
+
+        Matches the skip alignment in ``wait_for_save`` and ``save_kv_layer``:
+        a kv producer on the layerwise path stores from token 0, everyone else
+        drops the already-saved prefix aligned down to the LMCache chunk size.
+        """
+        save_spec = request.save_spec
+        if (
+            save_spec is None or not save_spec.can_save
+        ) and self.kv_role != "kv_producer":
+            return 0
+        token_ids = request.token_ids
+        if not isinstance(token_ids, list):
+            return 0
+        chunk_size = self._lmcache_chunk_size
+        if chunk_size <= 0:
+            return 0
+        if layerwise and self.kv_role == "kv_producer":
+            skip = 0
+        elif save_spec is None:
+            skip = 0
+        else:
+            skip = int(save_spec.skip_leading_tokens)
+            if (
+                not layerwise
+                and self.kv_role == "kv_producer"
+                and request.disagg_spec is not None
+            ):
+                skip = min(skip, int(request.disagg_spec.num_transferred_tokens))
+            if skip >= len(token_ids):
+                return 0
+            skip = skip // chunk_size * chunk_size
+        savable = len(token_ids) - skip
+        if savable <= 0:
+            return 0
+        return savable
+
+    def _pre_evict_save_batch(
+        self,
+        requests: list[ReqMeta],
+        *,
+        layerwise: bool,
+    ) -> None:
+        """Drop hot-cache chunks for this batch before any per-chunk allocate."""
+        engine = self.lmcache_engine
+        if engine is None:
+            return
+        pre_evict = getattr(engine, "pre_evict_for_save", None)
+        if not callable(pre_evict):
+            return
+        savable = [
+            self._savable_tokens_for_save(request, layerwise=layerwise)
+            for request in requests
+        ]
+        num_chunks = chunks_for_save_batch(savable, self._lmcache_chunk_size)
+        if num_chunks <= 0:
+            return
+        pre_evict(num_chunks)
+
     @_lmcache_nvtx_annotate
     def save_kv_layer(
         self,
@@ -1055,6 +1118,14 @@ class LMCacheConnectorV1Impl:
 
         kvcaches = list(self.kv_caches.values())
         is_first = True
+
+        # store_layer allocates on the first visit. Later layers only advance
+        # the generator, so the hot cache is trimmed once per batch.
+        if any(
+            self._layerwise_save_storers.get(request.req_id) is None
+            for request in connector_metadata.requests
+        ):
+            self._pre_evict_save_batch(connector_metadata.requests, layerwise=True)
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1160,6 +1231,10 @@ class LMCacheConnectorV1Impl:
 
         # Probe decoder cache before store if bidirectional mode is enabled
         bidir_enabled = getattr(self.config, "pd_bidirectional", False)
+
+        # Free one batch of hot-cache slots before the per-request store loop
+        # starts failing allocations and evicting a single chunk at a time.
+        self._pre_evict_save_batch(connector_metadata.requests, layerwise=False)
 
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id

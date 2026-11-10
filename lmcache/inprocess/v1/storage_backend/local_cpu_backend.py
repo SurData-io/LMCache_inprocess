@@ -26,7 +26,6 @@ from lmcache.inprocess.v1.storage_backend.batched_message_sender import (
 )
 from lmcache.inprocess.v1.storage_backend.cache_policy import get_cache_policy
 from lmcache.inprocess.v1.system_detection import NUMADetector, SystemMemoryDetector
-from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
@@ -41,6 +40,43 @@ if TYPE_CHECKING:
     from lmcache.inprocess.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+# One vLLM step stores at most max_num_batched_tokens / chunk_size chunks.
+# This bench is 8192 / 256 = 32. The cap is that step limit, not a new config key.
+STORE_PREEVICT_CHUNK_CAP = 32
+
+
+def chunks_for_save_batch(
+    savable_tokens: list[int],
+    chunk_size: int,
+    cap: int = STORE_PREEVICT_CHUNK_CAP,
+) -> int:
+    """Chunk upper bound for one store batch.
+
+    ``savable_tokens`` is how many tokens each request in the batch still
+    has to write. The result is the sum of per-request chunk counts, clamped
+    to ``cap`` so a batch cannot ask the hot cache to drop more than one
+    engine step of KV.
+    """
+    if chunk_size <= 0 or cap <= 0:
+        return 0
+    total = 0
+    for count in savable_tokens:
+        if count <= 0:
+            continue
+        total += (int(count) + chunk_size - 1) // chunk_size
+        if total >= cap:
+            return cap
+    return total
+
+
+def _chunk_size_bytes(shapes, dtypes) -> int:
+    """Bytes of one KV chunk. Imported lazily so store pre-evict can load
+    without the vLLM KV-format registry, which asks for native symbols.
+    """
+    from lmcache.integration.vllm.utils import get_size_bytes
+
+    return int(get_size_bytes(shapes, dtypes))
 
 
 class LocalCPUBackend(AllocatorBackendInterface):
@@ -424,7 +460,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             dtypes = metadata.get_dtypes()
 
             paged_mem_allocator = PagedCpuGpuMemoryAllocator()
-            chunk_size_bytes = get_size_bytes(shapes, dtypes)
+            chunk_size_bytes = _chunk_size_bytes(shapes, dtypes)
             origin_cpu_size_bytes = cpu_size_bytes
             align_cpu_size_bytes = (
                 origin_cpu_size_bytes // chunk_size_bytes * chunk_size_bytes
@@ -454,7 +490,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             if nixl_cpu_enabled:
                 if metadata is None:
                     raise ValueError("metadata required for NIXL CPU mode")
-                chunk_bytes = get_size_bytes(
+                chunk_bytes = _chunk_size_bytes(
                     metadata.get_shapes(), metadata.get_dtypes()
                 )
                 aligned_size = (cpu_size_bytes // chunk_bytes) * chunk_bytes
@@ -533,7 +569,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     fmt = MemoryFormat.KV_2LTD
 
                 # Calculate chunk size for alignment
-                chunk_size_bytes = get_size_bytes(shapes, dtypes)
+                chunk_size_bytes = _chunk_size_bytes(shapes, dtypes)
                 origin_cpu_size_bytes = cpu_size_bytes
                 # Align cpu_size_bytes to be a multiple of chunk_size_bytes
                 align_cpu_size_bytes = (
@@ -748,6 +784,98 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_obj
+
+    def _store_chunk_bytes(self) -> Optional[int]:
+        """Bytes of one full chunk already sitting in the hot cache.
+
+        Store chunks are uniform when partial chunks are not saved, so one
+        resident object's physical size is the slot size ``allocate`` needs.
+        """
+        for memory_obj in self.hot_cache.values():
+            size_of = getattr(memory_obj, "get_physical_size", None)
+            if not callable(size_of):
+                continue
+            try:
+                size = int(size_of())
+            except Exception:
+                continue
+            if size > 0:
+                return size
+        return None
+
+    def _free_chunk_slots(self, chunk_bytes: int) -> Optional[int]:
+        """How many chunk-sized blocks the pinned allocator can still hand out.
+
+        ``None`` means the allocator does not expose a free-byte count. The
+        caller then treats the pool as full and evicts the whole request.
+        """
+        if chunk_bytes <= 0:
+            return None
+        allocator = self.memory_allocator
+        pin = getattr(allocator, "pin_allocator", allocator)
+        address_manager = getattr(pin, "address_manager", None)
+        free_size = getattr(address_manager, "get_free_size", None)
+        if not callable(free_size):
+            return None
+        try:
+            free_bytes = int(free_size())
+        except Exception:
+            return None
+        if free_bytes < 0:
+            return None
+        return free_bytes // chunk_bytes
+
+    @_lmcache_nvtx_annotate
+    def ensure_free_chunks(self, num_chunks: int) -> int:
+        """Evict hot-cache chunks so a coming store can allocate without retrying.
+
+        ``num_chunks`` is the batch upper bound. Slots that are already free
+        are kept, and only the shortfall is dropped, in one pass. Pinned
+        objects and in-flight disk writes (``can_evict`` is false) stay.
+        Returns how many chunks were actually evicted. A shortfall does not
+        sleep or spin; the store path still evicts one chunk at a time if
+        this pass cannot free enough.
+        """
+        if num_chunks <= 0 or not self.use_hot:
+            return 0
+
+        chunk_bytes = self._store_chunk_bytes()
+        free_slots = None if chunk_bytes is None else self._free_chunk_slots(chunk_bytes)
+        if free_slots is None:
+            need = num_chunks
+        else:
+            need = num_chunks - free_slots
+        if need <= 0:
+            return 0
+
+        evicted = 0
+        with self.cpu_lock:
+            while evicted < need:
+                remaining = need - evicted
+                evict_keys = self.cache_policy.get_evict_candidates(
+                    self.hot_cache,
+                    num_candidates=min(64, remaining),
+                )
+                if not evict_keys:
+                    self.stats_monitor.update_local_cpu_evict_failed_count(remaining)
+                    break
+                # force=False keeps lookup pins. can_evict already skipped
+                # pinned and in-flight objects, and remove() does not take
+                # cpu_lock again when force is false.
+                removed = self.batched_remove(evict_keys, force=False)
+                if removed <= 0:
+                    self.stats_monitor.update_local_cpu_evict_failed_count(remaining)
+                    break
+                evicted += removed
+
+        if evicted:
+            self.stats_monitor.update_local_cpu_evict_metrics(evicted)
+            logger.debug(
+                "Pre-evicted %d chunks from local cpu hot cache for a %d chunk store",
+                evicted,
+                num_chunks,
+            )
+        return evicted
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
