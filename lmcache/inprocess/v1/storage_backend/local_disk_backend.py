@@ -48,12 +48,18 @@ class LocalDiskWorker:
         self, loop: asyncio.AbstractEventLoop, max_workers: int = _DEFAULT_THREAD_COUNT
     ) -> None:
         self.put_lock = threading.Lock()
-        self.put_tasks: List[CacheEngineKey] = []
+        self.put_tasks: set[CacheEngineKey] = set()
 
         self.prefetch_lock = threading.Lock()
         self.prefetch_tasks: dict[CacheEngineKey, Future] = {}
 
         self.executor = AsyncPQThreadPoolExecutor(loop, max_workers=max_workers)
+        # Puts must not wait for the storage event loop to enter write().
+        # That loop runs one coroutine at a time; prefetch stays on it.
+        self._write_pool = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="disk-put",
+        )
         self.loop = loop
         self._closed = False
 
@@ -81,10 +87,34 @@ class LocalDiskWorker:
             **kwargs,
         )
 
+    def submit_put(self, fn: Callable, /, *args: Any, **kwargs: Any) -> None:
+        """Start a disk put on the write pool.
+
+        The caller does not wait. The pool size is ``disk_io_threads``.
+        A worker logs its own failure; an uncaught exception is also logged
+        from the Future so it is not dropped.
+
+        :param fn: Callable that performs the put.
+        :param args: Positional arguments for ``fn``.
+        :param kwargs: Keyword arguments for ``fn``.
+        :raises RuntimeError: The worker has already been closed.
+        """
+        if self._closed:
+            raise RuntimeError("LocalDiskWorker is closed")
+        future = self._write_pool.submit(fn, *args, **kwargs)
+        future.add_done_callback(self._log_write_future)
+
+    @staticmethod
+    def _log_write_future(future: Future) -> None:
+        try:
+            future.result()
+        except Exception:
+            logger.exception("Disk put task failed")
+
     def remove_put_task(self, key: CacheEngineKey):
         with self.put_lock:
             if key in self.put_tasks:
-                self.put_tasks.remove(key)
+                self.put_tasks.discard(key)
             else:
                 logger.warning("Key %s not found in put tasks.", key)
 
@@ -101,12 +131,12 @@ class LocalDiskWorker:
         with self.put_lock:
             if key in self.put_tasks:
                 return False
-            self.put_tasks.append(key)
+            self.put_tasks.add(key)
             return True
 
     def insert_put_task(self, key: CacheEngineKey):
         with self.put_lock:
-            self.put_tasks.append(key)
+            self.put_tasks.add(key)
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         with self.put_lock:
@@ -117,6 +147,7 @@ class LocalDiskWorker:
         if self._closed:
             return
         self._closed = True
+        self._write_pool.shutdown(wait=True)
         self.executor.shutdown(wait=True)
 
 
@@ -183,10 +214,8 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_worker = LocalDiskWorker(loop, max_workers=thread_count)
 
         # Plain ThreadPoolExecutor for batched_get_blocking (concurrent
-        # synchronous reads).  The existing AsyncPQThreadPoolExecutor in
-        # disk_worker is async/priority-queue based and only serves writes
-        # and prefetches; a simple pool is a better fit for the blocking
-        # read path where we want ThreadPoolExecutor.map() semantics.
+        # synchronous reads). Puts use disk_worker's write pool. The
+        # priority-queue executor still serves prefetches.
         self._read_thread_pool = ThreadPoolExecutor(
             max_workers=thread_count,
             thread_name_prefix="disk-read",
@@ -432,16 +461,19 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.disk_worker.remove_put_task(key)
         memory_obj.ref_count_up()
 
-        asyncio.run_coroutine_threadsafe(
-            self.disk_worker.submit_task(
-                "put",
+        try:
+            self.disk_worker.submit_put(
                 self.async_save_bytes_to_disk,
                 key=key,
                 memory_obj=memory_obj,
                 on_complete_callback=on_complete_callback,
-            ),
-            self.loop,
-        )
+            )
+        except Exception:
+            logger.exception("Failed to submit disk put for key %s", key)
+            memory_obj.ref_count_down()
+            self.disk_worker.remove_put_task(key)
+            with self.disk_lock:
+                self.current_cache_size -= required_size
 
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
@@ -716,7 +748,17 @@ class LocalDiskBackend(StorageBackendInterface):
         self.stats_monitor.update_local_storage_usage(self.usage)
 
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(buffer, path)
+        try:
+            self.write_file(buffer, path)
+        except Exception:
+            logger.exception("Disk put failed for key %s", key)
+            self.usage -= size
+            self.stats_monitor.update_local_storage_usage(self.usage)
+            with self.disk_lock:
+                self.current_cache_size -= memory_obj.get_physical_size()
+            memory_obj.ref_count_down()
+            self.disk_worker.remove_put_task(key)
+            return
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.

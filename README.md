@@ -1,5 +1,18 @@
 # LMCache InProcess
 
+## 2026-11-12 写盘直接进线程池
+
+`submit_put_task` 不再把落盘协程交给 `storage-manager-event-loop`。`LocalDiskWorker.submit_put` 把 `async_save_bytes_to_disk` 直接提交给名为 `disk-put` 的 `ThreadPoolExecutor`，大小仍是已有的 `disk_io_threads`（默认 4）。预取还走原来的优先级队列。没有新配置项。
+
+`put_tasks` 从列表改成集合。登记、查找、删除都是 O(1)，不再在 `disk_lock` 里线性扫描在飞 key。`write_file` 抛错时减引用、从在飞集合去掉 key、退回这次加上的用量和 `current_cache_size`，不 `insert_key`。提交进线程池失败时同样减引用、去掉 key，并退回已经计入的 `current_cache_size`。
+
+### 已完成
+- 写盘直接进线程池。在飞 key 用集合。写失败释放引用和配额。
+- `tests/inprocess/v1/storage_backend/test_local_disk_put_admission.py` 覆盖 4 路同时停在 `write_file`，以及写失败后引用下降、key 不进 `dict`。
+
+### 尚未完成
+- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。
+
 ## 2026-11-11 对齐预算，腾不够就丢掉 KV
 
 预算和空闲槽都按对齐后的整块算。`aligned_savable_tokens` 与 `wait_for_save` 的实际写入对齐：`slot_mapping` 和 token 长度不一致算 0；`skip_leading_tokens` 向下对齐到 `chunk_size`；不是最后一段 prefill 且没开 blending 时，结尾也向下对齐。块数是 `savable // chunk_size`，尾巴不再 `ceil`。layerwise 一条 chunk 要 `num_layers` 个对象，槽位按这个倍数算，token 块数仍钳到 32。
