@@ -1,5 +1,21 @@
 # LMCache InProcess
 
+## 2026-11-12 读盘按 preload 空槽放行
+
+`20261112-151524` 第二轮 800 条索引都是 2048，调度器拿到 2048 的只有 342 条，457 条是 0。GET 的预算读的是 `memory_allocator`。20GiB 拆开之后这个对象是 store 池。申请发生在 preload 池。store 池腾出来之后，每一拍仍按那边的空闲字节再放行一批读，preload 里没有下一块就失败。
+
+`_host_free_bytes` 改为可分配块的字节。池拆开时读 preload 分配器：不小于一块的洞按块相加，小于一块的碎片算 0。`fits` 的比较式不变。store 池空着、preload 没有下一块时，这一拍不再放行。
+
+`batched_async_load_bytes_from_disk` 用已有的 `_read_thread_pool`（`disk_io_threads`，默认 4）同时读。读的时候不占 `disk_lock`。返回的是连续前缀：失败的那块释放，它后面已经读完的块也释放。8GiB / 12GiB、128 的信号量、store 池水位都不改。没有新配置项。
+
+### 已完成
+- 读盘预算按 preload 可分配块数。
+- 异步读盘同时最多 `disk_io_threads` 个。
+- 测试覆盖 store 被占满时预算仍看 preload，以及多块同时读、中间失败只保留前缀。
+
+### 尚未完成
+- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。
+
 ## 2026-11-12 按可分配块数回收 store 池
 
 `store()` 逐块申请。一块是对齐后的 chunk。几段各自装得下一块的洞，块数相加。小于一块的碎片算 0。`ensure_free_chunks` 在可分配块数少于这一拍的预算时继续驱逐 store 池里 `can_evict` 的对象，不再因为「原始空闲字节已经够、最长空段至少一块」就停。返回的是可分配块数。`wait_for_save` 用这个数扣每一条请求。在飞写和 pin 住的对象仍然不回收。32 块的步上限、8GiB / 12GiB 两池不变。
@@ -11,8 +27,11 @@
 - 入场按可分配块数扣减。一段 7 块不够 8 时会再腾。
 - 隔块的洞可以相加后做 8 次逐块申请。引用大于 1 和 preload 池的对象仍不回收。
 
-### 尚未完成
-- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。
+### 已复测
+- 镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-68fc63b`（`sha256:1933fe256a005c1ee23087e75c9e8f572088fffc5f97b8c1dbdeb7a849ac3339`）。三个文件的 md5 与本机 `68fc63b` 一致：`local_cpu_backend.py` `1f9d0ff2116c013fb2cabbe86051571b`，`cache_engine.py` `355ec1986d6c30c1ee6476bfea5ad0aa`，`vllm_v1_adapter.py` `3bfd4602b244a6844f21e14099306c48`。
+- 2026-11-12 15:15 在新 RTX 3090 上复测，戳 `20261112-151524`。盘是 `/dev/vdc` 上的 XFS，`file:///mnt/xfs/surdata-xfs/native/kvcache`。协议与 `20261112-134737` 相同：800×2、rate 800、`max_model_len` 8192、两个开关都开。综合 297.532 tok/s = (51076+34470)/287.519。Turn1 178.426s，4.48 req/s，286.26 tok/s，51076 token，TTFT 均/中/P99 84693.74/85068.14/167265.14 ms。Turn2 109.093s，7.33 req/s，315.97 tok/s，34470 token，TTFT 114661.94/111166.77/141156.55 ms。`wall_s=287.519`，重叠 261.217s。两轮 800/0。`EXIT_RC=0`。GPU 已放开。
+- 同机原生 LMCache+XFS `20261112-115332` 综合 393.420 tok/s。同协议历史最好仍是 `20261112-134737` 的 302.180 tok/s。这台 3090 没有「不存」跑次。
+- 这次 `Dropping KV` 是 0。Turn2 入场 2048×342、0×457、512×1。preload 池分不出连续块 458 次。
 
 ## 2026-11-12 store 池和 preload 池
 
@@ -29,7 +48,7 @@ D2H 的 `store` / `store_layer` 用 `purpose="store"`。回收只拿 store 池�
 - `tests/inprocess/v1/test_local_cpu_pre_evict.py` 覆盖两池隔离、在飞写不回收、隔块洞相加、七块时继续驱逐。
 
 ### 尚未完成
-- 两池拆分已打进镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-767b77b`，并跑过 `20261112-134737`。按块数回收还没有打进镜像。
+- 两池拆分已打进镜像 `vllm-openai:v0.33.0-lmcache0.5.7-pr9-767b77b`，并跑过 `20261112-134737`。按块数回收的复测见上一节 `20261112-151524`。
 
 ## 2026-11-12 写盘直接进线程池
 

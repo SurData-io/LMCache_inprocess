@@ -787,6 +787,37 @@ class LocalDiskBackend(StorageBackendInterface):
                 logger.warning("on_complete_callback failed for key %s: %s", key, e)
 
     @_lmcache_nvtx_annotate
+    def _finish_prefetched_chunk(
+        self,
+        path: str,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+    ) -> Optional[MemoryObj]:
+        """Read one prefetched chunk. Safe to run on the disk-read pool.
+
+        The read itself does not hold ``disk_lock``. Metadata and the pin
+        taken before the read are updated under that lock. A failed read
+        drops the staging buffer and the pin, and returns ``None``.
+        """
+        try:
+            self.read_file(key, memory_obj.byte_array, path)
+        except Exception:
+            logger.exception("Disk read failed for key %s", key)
+            with self.disk_lock:
+                meta = self.dict.get(key)
+                if meta is not None:
+                    meta.unpin()
+            memory_obj.ref_count_down()
+            return None
+        with self.disk_lock:
+            meta = self.dict.get(key)
+            if meta is None:
+                memory_obj.ref_count_down()
+                return None
+            memory_obj.metadata.cached_positions = meta.cached_positions
+            meta.unpin()
+        return memory_obj
+
     def batched_async_load_bytes_from_disk(
         self,
         paths: list[str],
@@ -794,25 +825,33 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: list[MemoryObj],
         write_back: bool = False,
     ) -> list[MemoryObj]:
-        """
-        Async load bytearray from disk.
-        """
+        """Load prefetched chunks on the disk-read pool.
 
+        ``disk_io_threads`` workers read at once. The returned list is the
+        contiguous prefix: a failed chunk is released, and any chunk after
+        that hole is released too, even if its read finished.
+        """
+        del write_back
+        if not memory_objs:
+            return []
         logger.debug("Executing `async_load_bytes` from disk.")
-        # TODO (Jiayi): handle the case where loading fails.
-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
-            buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
-
-            # TODO(Jiayi): Please recover the metadata in a more
-            # elegant way in the future.
-            cached_positions = self.dict[key].cached_positions
-            mem_obj.metadata.cached_positions = cached_positions
-
-            with self.disk_lock:
-                self.dict[key].unpin()
-
-        return memory_objs
+        loaded = list(
+            self._read_thread_pool.map(
+                self._finish_prefetched_chunk,
+                paths,
+                keys,
+                memory_objs,
+            )
+        )
+        prefix: list[MemoryObj] = []
+        for memory_obj in loaded:
+            if memory_obj is None:
+                break
+            prefix.append(memory_obj)
+        for memory_obj in loaded[len(prefix) :]:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+        return prefix
 
     def load_bytes_from_disk(
         self,

@@ -219,6 +219,58 @@ def test_allocatable_slots_add_holes_and_ignore_fragments():
     assert aligned_free_slot_count(blocks, 0) == 0
 
 
+def test_disk_budget_counts_preload_slots_not_store_free_bytes():
+    """A disk GET is budgeted from the preload pool's one-chunk holes.
+
+    Filling the store pool does not change that number. A fragment smaller
+    than one chunk is not part of it.
+    """
+    chunk = 65536
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        lmcache_instance_id="pre_evict_preload_budget",
+    )
+    store = MixedMemoryAllocator(1 << 20)
+    preload = MixedMemoryAllocator(chunk * 2 + 4096)
+    backend = LocalCPUBackend(config=config, memory_allocator=store)
+    backend.preload_allocator = preload
+    backend.store_allocator = store
+    backend._split_pools = True
+    backend._full_chunk_size_bytes = chunk
+    try:
+        before = backend.host_allocatable_bytes(chunk)
+        stats = backend._pool_free_stats(preload, chunk)
+        assert stats is not None and before is not None
+        assert stats[2] == 2
+        assert before == 2 * chunk
+        assert stats[0] > before
+        store_obj = backend.allocate(_SHAPE, _DTYPE, eviction=False, purpose="store")
+        assert store_obj is not None
+        assert backend.host_allocatable_bytes(chunk) == before
+        store_obj.ref_count_down()
+
+        import sys
+
+        pkg = sys.modules.get("lmcache.inprocess.v1.storage_backend")
+        if pkg is not None:
+            if not hasattr(pkg, "CreateStorageBackends"):
+                pkg.CreateStorageBackends = None
+            if not hasattr(pkg, "is_cuda_worker"):
+                pkg.is_cuda_worker = lambda metadata: False
+        from lmcache.inprocess.v1.storage_backend.storage_manager import (
+            StorageManager,
+        )
+
+        manager = StorageManager.__new__(StorageManager)
+        manager.local_cpu_backend = backend
+        assert manager._host_free_bytes() == before
+    finally:
+        store.close()
+        preload.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
 def test_pool_sizes_match_surdata_direct_pools():
     """8GiB store and 12GiB preload. These are the fixed SurData sizes."""
     assert STORE_POOL_BYTES == 8589934592

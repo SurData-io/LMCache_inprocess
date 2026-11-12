@@ -995,21 +995,30 @@ class StorageManager:
         )
 
     def _host_free_bytes(self) -> Optional[int]:
+        """Bytes a disk GET can still pin, counted in whole chunks.
+
+        Split pools read the preload allocator. The store pool's free bytes
+        do not admit a read. A hole smaller than one chunk counts as zero.
+        ``None`` means the free list could not be read; the drain then treats
+        the prefix as fitting.
+        """
         backend = self.local_cpu_backend
         if not isinstance(backend, LocalCPUBackend):
             return None
-        alloc = getattr(backend, "memory_allocator", None)
-        if alloc is None:
+        aligned = self._aligned_chunk_bytes()
+        if aligned is None:
             return None
-        pin = getattr(alloc, "pin_allocator", alloc)
-        free = getattr(pin, "get_free_size", None)
-        if callable(free):
-            return int(free())
-        address_manager = getattr(pin, "address_manager", None)
-        free = getattr(address_manager, "get_free_size", None)
-        if callable(free):
-            return int(free())
-        return None
+        reader = getattr(backend, "host_allocatable_bytes", None)
+        if not callable(reader):
+            return None
+        try:
+            value = reader(aligned)
+        except Exception:
+            logger.debug("preload allocatable bytes are unavailable", exc_info=True)
+            return None
+        if value is None:
+            return None
+        return int(value)
 
     def _aligned_chunk_bytes(self) -> Optional[int]:
         """Aligned bytes of one chunk. None when the size is not known."""

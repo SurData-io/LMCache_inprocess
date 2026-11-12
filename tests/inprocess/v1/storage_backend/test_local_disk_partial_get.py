@@ -2,6 +2,7 @@
 """Local disk GET must release disk_lock when host allocation stops early."""
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -54,7 +55,8 @@ class _CPU:
     def __init__(self, results: list) -> None:
         self._results = list(results)
 
-    def allocate(self, shape, dtype, fmt, busy_loop: bool = False):
+    def allocate(self, shape, dtype, fmt, busy_loop: bool = False, purpose: str = "store"):
+        del purpose
         assert busy_loop is False
         return self._results.pop(0)
 
@@ -79,6 +81,7 @@ def _backend(metas: dict, alloc_results: list) -> tuple[LocalDiskBackend, _Worke
     worker = _Worker(backend)
     backend.disk_worker = worker
     backend.read_file = lambda key, buffer, path: None
+    backend._read_thread_pool = ThreadPoolExecutor(max_workers=4)
     return backend, worker
 
 
@@ -106,6 +109,7 @@ def test_second_key_alloc_failure_reads_only_the_prefix() -> None:
     assert metas[first].pin_count == 0
     assert metas[second].pin_count == 0
     assert _lock_is_free(backend.disk_lock)
+    backend._read_thread_pool.shutdown(wait=True)
 
 
 def test_first_key_alloc_failure_skips_disk_read() -> None:
@@ -120,6 +124,58 @@ def test_first_key_alloc_failure_skips_disk_read() -> None:
     assert metas[first].pin_count == 0
     assert metas[second].pin_count == 0
     assert _lock_is_free(backend.disk_lock)
+    backend._read_thread_pool.shutdown(wait=True)
+
+
+def test_async_load_reads_on_the_pool_and_keeps_order() -> None:
+    """Several chunks are read at once. A hole ends the returned prefix."""
+    width = 4
+    keys = [_key(i) for i in range(8)]
+    metas = {key: _meta(f"p{i}") for i, key in enumerate(keys)}
+    for meta in metas.values():
+        meta.pin()
+    current = {"n": 0, "max": 0}
+    gate = threading.Barrier(width)
+    lock = threading.Lock()
+
+    def read_file(key, buffer, path):
+        del key, buffer
+        with lock:
+            current["n"] += 1
+            current["max"] = max(current["max"], current["n"])
+        try:
+            gate.wait(timeout=2)
+        finally:
+            with lock:
+                current["n"] -= 1
+        if path == "p3":
+            raise OSError("read failed")
+
+    mems = []
+    released = []
+    for _ in keys:
+        memory_obj = _Mem()
+
+        def _down(obj=memory_obj):
+            released.append(obj)
+
+        memory_obj.ref_count_down = _down
+        mems.append(memory_obj)
+    backend, _worker = _backend(metas, [])
+    backend.read_file = read_file
+    try:
+        result = backend.batched_async_load_bytes_from_disk(
+            [metas[key].path for key in keys],
+            keys,
+            mems,
+        )
+    finally:
+        backend._read_thread_pool.shutdown(wait=True)
+    assert current["max"] >= width
+    assert result == mems[:3]
+    assert mems[3] in released
+    assert all(obj in released for obj in mems[4:])
+    assert all(meta.pin_count == 0 for meta in metas.values())
 
 
 def test_missing_key_still_raises_and_releases_the_lock() -> None:
@@ -132,3 +188,4 @@ def test_missing_key_still_raises_and_releases_the_lock() -> None:
 
     assert worker.calls == []
     assert _lock_is_free(backend.disk_lock)
+    backend._read_thread_pool.shutdown(wait=True)

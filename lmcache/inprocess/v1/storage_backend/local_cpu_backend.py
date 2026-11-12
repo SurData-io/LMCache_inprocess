@@ -1015,6 +1015,24 @@ class LocalCPUBackend(AllocatorBackendInterface):
         with lock:
             return _read()
 
+    def allocatable_bytes(self, allocator, aligned_bytes: int) -> Optional[int]:
+        """Bytes covered by one-chunk holes in ``allocator``.
+
+        A hole smaller than ``aligned_bytes`` adds nothing. ``None`` means
+        the free list is hidden or the chunk size is unknown. Several holes
+        add, because ``allocate`` takes one chunk at a time.
+        """
+        if aligned_bytes <= 0:
+            return None
+        stats = self._pool_free_stats(allocator, aligned_bytes)
+        if stats is None:
+            return None
+        return int(stats[2]) * int(aligned_bytes)
+
+    def host_allocatable_bytes(self, aligned_bytes: int) -> Optional[int]:
+        """Bytes a disk GET can pin. Split pools use the preload allocator."""
+        return self.allocatable_bytes(self._allocator_for("preload"), aligned_bytes)
+
     def aligned_store_slot_bytes(self) -> int:
         """One store chunk, aligned. Zero when the size cannot be known."""
         size = self._aligned_slot_bytes()

@@ -876,6 +876,56 @@ def test_net_free_drains_only_when_the_prefix_still_fits():
     assert manager.tier_queue.is_reading("r") is True
 
 
+def test_host_free_bytes_follows_preload_when_the_store_pool_is_full():
+    """The drain budget is the preload pool. A full store pool leaves it set."""
+    pytest.importorskip("torch")
+    import torch
+    from lmcache.inprocess.observability import LMCStatsMonitor
+    from lmcache.inprocess.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+    from lmcache.v1.memory_allocators.mixed_memory_allocator import (
+        MixedMemoryAllocator,
+    )
+
+    import sys
+
+    pkg = sys.modules.get("lmcache.inprocess.v1.storage_backend")
+    if pkg is not None and not hasattr(pkg, "CreateStorageBackends"):
+        pkg.CreateStorageBackends = None
+        pkg.is_cuda_worker = lambda metadata: False
+    storage_manager = _storage_manager_cls()
+    chunk = 65536
+    store = MixedMemoryAllocator(1 << 20)
+    preload = MixedMemoryAllocator(chunk * 2 + 4096)
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        lmcache_instance_id="tier_preload_budget",
+    )
+    backend = LocalCPUBackend(config=config, memory_allocator=store)
+    backend.preload_allocator = preload
+    backend.store_allocator = store
+    backend._split_pools = True
+    backend._full_chunk_size_bytes = chunk
+    try:
+        store_obj = backend.allocate(
+            torch.Size([2, 16, 8, 128]),
+            torch.bfloat16,
+            eviction=False,
+            purpose="store",
+        )
+        assert store_obj is not None
+        store_obj.ref_count_down()
+        manager = storage_manager.__new__(storage_manager)
+        manager.local_cpu_backend = backend
+        budget = manager._host_free_bytes()
+        assert budget == 2 * chunk
+        assert budget > 0
+    finally:
+        store.close()
+        preload.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
 def test_new_lookup_drains_while_a_release_hold_is_set():
     manager = _manager(True, _Backend(0))
     manager._tier_release_hold = 800
