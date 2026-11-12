@@ -352,16 +352,25 @@ class StorageManager:
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
         busy_loop=True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """
         Allocate memory object with memory allocator.
         Use LRU evictor if eviction is enabled.
+
+        ``purpose`` is ``store`` for D2H and ``preload`` for a disk read.
+        A backend with one allocator ignores it.
         """
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
         assert self.allocator_backend is not None
         memory_obj = self.allocator_backend.allocate(
-            shapes, dtypes, fmt, eviction=eviction, busy_loop=busy_loop
+            shapes,
+            dtypes,
+            fmt,
+            eviction=eviction,
+            busy_loop=busy_loop,
+            purpose=purpose,
         )
         self._maybe_drain_on_net_free()
         return memory_obj
@@ -375,17 +384,26 @@ class StorageManager:
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction=True,
         busy_loop=True,
+        purpose: str = "store",
     ) -> Optional[list[MemoryObj]]:
         """
         Batched allocate memory object with memory allocator.
         Use LRU evictor if eviction is enabled.
+
+        ``purpose`` is ``store`` for D2H and ``preload`` for a disk read.
         """
         # TODO (Jiayi): We might need to pre-allocate and management
         # disk in a similar way as CPU.
         if self.allocator_backend is None:
             raise RuntimeError("Allocator backend not available for scheduler role")
         memory_objs = self.allocator_backend.batched_allocate(
-            shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=busy_loop
+            shapes,
+            dtypes,
+            batch_size,
+            fmt,
+            eviction=eviction,
+            busy_loop=busy_loop,
+            purpose=purpose,
         )
         self._maybe_drain_on_net_free()
         return memory_objs

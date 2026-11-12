@@ -382,12 +382,18 @@ class LMCacheEngine:
             return self.storage_manager.is_hot_cache_enabled()
         return False
 
-    def pre_evict_for_save(self, num_chunks: int) -> int:
-        """Free local-CPU hot-cache slots before this step's stores allocate.
+    def pre_evict_for_save(
+        self,
+        num_chunks: int,
+        need_bytes: int = 0,
+        span_bytes: int = 0,
+    ) -> int:
+        """Reclaim the store pool before this step's stores allocate.
 
-        ``num_chunks`` is the aligned slot demand of the batch. Eviction is
-        best-effort: pinned and in-flight objects stay. Returns how many
-        aligned slots are free afterwards, which may be less than the demand.
+        ``num_chunks`` is the aligned slot demand. ``need_bytes`` is that
+        demand in bytes. ``span_bytes`` is one aligned chunk. Eviction is
+        best-effort and only takes store-pool objects that ``can_evict``.
+        Returns how many chunks fit in the longest free span afterwards.
         A caller that still cannot fit one request skips that store and does
         not copy KV off the GPU.
         """
@@ -397,7 +403,9 @@ class LMCacheEngine:
         ensure = getattr(backend, "ensure_free_chunks", None)
         if not callable(ensure):
             return 0
-        return int(ensure(num_chunks))
+        return int(
+            ensure(num_chunks, need_bytes=need_bytes, span_bytes=span_bytes)
+        )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -536,6 +544,7 @@ class LMCacheEngine:
                     if drop_on_alloc_miss
                     else self.config.get_extra_config_value("force_store_wait", False),
                     fmt=self.fmt,
+                    purpose="store",
                 )
                 if memory_obj is None:
                     if drop_on_alloc_miss:
@@ -745,6 +754,7 @@ class LMCacheEngine:
                 busy_loop=False
                 if drop_on_alloc_miss
                 else self.config.get_extra_config_value("force_store_wait", False),
+                purpose="store",
             )
 
             if memory_objs_multi_layer is None:

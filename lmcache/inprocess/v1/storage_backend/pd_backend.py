@@ -361,7 +361,9 @@ class PDBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
+        del purpose
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
         # NOTE: no eviction and busy_loop in PD
@@ -380,7 +382,9 @@ class PDBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ):
+        del purpose
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
         alloc_type = "cpu" if self.corrected_device == "cpu" else "gpu"

@@ -1,5 +1,22 @@
 # LMCache InProcess
 
+## 2026-11-12 store 池和 preload 池
+
+`max_local_cpu_size` 正好是 20 时，默认的非分页 `MixedMemoryAllocator` 拆成两块。store 池 `8589934592`（8GiB），preload 池 `12884901888`（12GiB）。这两个数和 SurData 直连的 `STORE_POOL_DEFAULT` / `PRELOAD_POOL_DEFAULT` 相同，不从 `MemTotal`、`max_local_cpu_size` 或 OOM 日志推。没有新配置项。P2P、NIXL、io_uring，以及单测注入的小分配器，仍是一个分配器。只有一个分配器时 `purpose` 不起作用。
+
+D2H 的 `store` / `store_layer` 用 `purpose="store"`。`wait_for_save` 先按这一拍的字节和回收 store 池，同时要求最长的连续空段至少能装下一块。回收只拿本池里 `can_evict` 的热缓存对象：没被 pin，且引用等于 1。正在写盘的对象引用大于 1，留在 store 池里。回收之后入场看的是最长连续空段能装下的块数，不再把各段碎片相加。一段小于一块的空洞计 0。装不下的整条请求跳过，不调用 `batched_from_gpu`。`drop_on_alloc_miss` 时分配仍然 `eviction=False`。
+
+读盘三处用 `purpose="preload"`：`batched_get_non_blocking`、`batched_get_blocking`、`load_bytes_from_disk`。`busy_loop` 保持原来的值。preload 池分不出连续的一块时停在当前 key，不进 store 池去抢。
+
+### 已完成
+- 20GiB 默认分配器拆成 8GiB store 和 12GiB preload。
+- 水位按字节和最长连续空段回收 store 池。装不下就整请求跳过 D2H。
+- 读盘只从 preload 池申请。
+- `tests/inprocess/v1/test_local_cpu_pre_evict.py` 覆盖两池隔离、在飞写不回收、碎片不算入场空槽、水位够了才进入 store。
+
+### 尚未完成
+- 没有把这次改动打进 GPU 镜像，也没有复测 800×2。
+
 ## 2026-11-12 写盘直接进线程池
 
 `submit_put_task` 不再把落盘协程交给 `storage-manager-event-loop`。`LocalDiskWorker.submit_put` 把 `async_save_bytes_to_disk` 直接提交给名为 `disk-put` 的 `ThreadPoolExecutor`，大小仍是已有的 `disk_io_threads`（默认 4）。预取还走原来的优先级队列。没有新配置项。

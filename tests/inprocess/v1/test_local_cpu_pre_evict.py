@@ -11,11 +11,14 @@ import torch
 from lmcache.inprocess.observability import LMCStatsMonitor
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
 from lmcache.inprocess.v1.storage_backend.local_cpu_backend import (
+    PRELOAD_POOL_BYTES,
+    STORE_POOL_BYTES,
     STORE_PREEVICT_CHUNK_CAP,
     LocalCPUBackend,
     aligned_free_slot_count,
     aligned_savable_tokens,
     chunks_for_save_batch,
+    largest_contiguous_slot_count,
 )
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
@@ -197,6 +200,182 @@ def test_ensure_free_chunks_does_not_evict_when_slots_are_free():
         assert free_slots >= 8
         assert key in backend.hot_cache
         assert len(backend.hot_cache) == 1
+    finally:
+        allocator.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_largest_contiguous_slot_count_is_not_the_sum_of_holes():
+    """Two holes that each hold three chunks admit three, not six."""
+    aligned = 8192
+    blocks = [
+        _FreeBlock(aligned * 3),
+        _FreeBlock(aligned * 3),
+        _FreeBlock(aligned - 1),
+    ]
+    assert aligned_free_slot_count(blocks, aligned) == 6
+    assert largest_contiguous_slot_count(blocks, aligned) == 3
+    assert largest_contiguous_slot_count([_FreeBlock(aligned - 1)], aligned) == 0
+    assert largest_contiguous_slot_count(blocks, 0) == 0
+
+
+def test_pool_sizes_match_surdata_direct_pools():
+    """8GiB store and 12GiB preload. These are the fixed SurData sizes."""
+    assert STORE_POOL_BYTES == 8589934592
+    assert PRELOAD_POOL_BYTES == 12884901888
+    assert STORE_POOL_BYTES + PRELOAD_POOL_BYTES == 20 * 1024**3
+
+
+def test_preload_allocate_does_not_shrink_the_store_pool():
+    """With two allocators, a preload allocate leaves the store free list."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        lmcache_instance_id="pre_evict_split",
+    )
+    store = MixedMemoryAllocator(1 << 20)
+    preload = MixedMemoryAllocator(1 << 20)
+    backend = LocalCPUBackend(config=config, memory_allocator=store)
+    backend.preload_allocator = preload
+    backend.store_allocator = store
+    backend._split_pools = True
+    try:
+        before = backend._pool_free_stats(store, 4096)
+        memory_obj = backend.allocate(
+            _SHAPE, _DTYPE, eviction=False, purpose="preload"
+        )
+        assert memory_obj is not None
+        assert getattr(memory_obj, "parent_allocator", None) is preload
+        after = backend._pool_free_stats(store, 4096)
+        assert after == before
+        preload_after = backend._pool_free_stats(preload, 4096)
+        assert preload_after is not None and before is not None
+        assert preload_after[0] < before[0]
+        memory_obj.ref_count_down()
+    finally:
+        store.close()
+        preload.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_store_watermark_does_not_evict_preload_objects():
+    """Reclaim for D2H only removes can_evict objects that live in the store pool."""
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        lmcache_instance_id="pre_evict_split_evict",
+    )
+    store = MixedMemoryAllocator(256 * 1024)
+    preload = MixedMemoryAllocator(1 << 20)
+    backend = LocalCPUBackend(config=config, memory_allocator=store)
+    backend.preload_allocator = preload
+    backend.store_allocator = store
+    backend._split_pools = True
+    try:
+        store_keys = _fill(backend)
+        assert store_keys
+        preload_obj = backend.allocate(
+            _SHAPE, _DTYPE, eviction=False, purpose="preload"
+        )
+        assert preload_obj is not None
+        preload_key = _key(10_000)
+        backend.submit_put_task(preload_key, preload_obj)
+        preload_obj.ref_count_down()
+        backend.ensure_free_chunks(len(store_keys) + 1)
+        assert preload_key in backend.hot_cache
+        assert getattr(backend.hot_cache[preload_key], "parent_allocator", None) is preload
+    finally:
+        store.close()
+        preload.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_single_allocator_purpose_shares_the_pool():
+    """purpose does nothing when the backend was given one allocator."""
+    backend, allocator = _backend(1 << 20)
+    try:
+        before = backend._pool_free_stats(allocator, 4096)
+        memory_obj = backend.allocate(
+            _SHAPE, _DTYPE, eviction=False, purpose="preload"
+        )
+        assert memory_obj is not None
+        after = backend._pool_free_stats(allocator, 4096)
+        assert before is not None and after is not None
+        assert after[0] < before[0]
+        memory_obj.ref_count_down()
+    finally:
+        allocator.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_inflight_store_is_not_reclaimed_by_the_watermark():
+    """A store object with ref_count > 1 stays. The watermark cannot take it."""
+    backend, allocator = _backend(2 * 1024 * 1024)
+    try:
+        resident = _fill(backend)
+        assert len(resident) >= 4
+        held = resident[0]
+        backend.hot_cache[held].ref_count_up()
+        try:
+            backend.ensure_free_chunks(len(resident))
+            assert held in backend.hot_cache
+            assert not backend.hot_cache[held].can_evict
+        finally:
+            backend.hot_cache[held].ref_count_down()
+    finally:
+        allocator.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_fragmented_free_bytes_do_not_admit_a_full_request():
+    """Enough total free bytes, but no span holds the request. Admission is short.
+
+    Every other chunk is freed and the rest are pinned, so the holes cannot
+    be merged or reclaimed. The longest span is what wait_for_save compares
+    with the request. A request of 8 chunks is not started.
+    """
+    backend, allocator = _backend(2 * 1024 * 1024)
+    try:
+        resident = _fill(backend)
+        assert len(resident) >= 8
+        for key in resident[::2]:
+            assert backend.remove(key, force=True)
+        for key in resident[1::2]:
+            assert backend.hot_cache[key].pin()
+        aligned = backend.aligned_store_slot_bytes()
+        assert aligned > 0
+        summed = backend._aligned_free_slots(aligned)
+        span = backend.ensure_free_chunks(8)
+        assert summed is not None
+        assert summed > span
+        assert span < 8
+        for key in resident[1::2]:
+            assert key in backend.hot_cache
+    finally:
+        allocator.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_watermark_reclaim_admits_store_when_the_span_fits():
+    """After reclaim, store() can take a request that fits in the longest span."""
+    backend, allocator = _backend(2 * 1024 * 1024)
+    try:
+        resident = _fill(backend)
+        assert len(resident) >= 4
+        slot_bytes = backend.aligned_store_slot_bytes()
+        span = backend.ensure_free_chunks(
+            4, need_bytes=4 * slot_bytes, span_bytes=slot_bytes
+        )
+        assert span >= 4
+        held = []
+        for _ in range(4):
+            memory_obj = backend.allocate(
+                _SHAPE, _DTYPE, eviction=False, purpose="store"
+            )
+            assert memory_obj is not None
+            held.append(memory_obj)
+        for memory_obj in held:
+            memory_obj.ref_count_down()
     finally:
         allocator.close()
         LMCStatsMonitor.DestroyInstance()

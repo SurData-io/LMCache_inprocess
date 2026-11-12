@@ -569,7 +569,9 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # --- 2. Pre-allocate staging buffers (sequential) -----------------
         memory_objs = [
-            self.local_cpu_backend.allocate(m.shape, m.dtype, m.fmt)
+            self.local_cpu_backend.allocate(
+                m.shape, m.dtype, m.fmt, purpose="preload"
+            )
             if m is not None
             else None
             for m in metas
@@ -673,13 +675,13 @@ class LocalDiskBackend(StorageBackendInterface):
                         dtype,
                         fmt,
                         busy_loop=False,
+                        purpose="preload",
                     )
                     if memory_obj is None:
                         logger.error(
                             "Memory allocation failed during async disk load for "
-                            "key %s. CPU staging pool may be exhausted (unpin() "
-                            "not called after a previous retrieve). Returning "
-                            "partial results.",
+                            "key %s. Preload pool has no contiguous chunk. "
+                            "Returning partial results.",
                             key,
                         )
                     else:
@@ -824,7 +826,9 @@ class LocalDiskBackend(StorageBackendInterface):
         Load bytearray from disk.
         """
 
-        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+        memory_obj = self.local_cpu_backend.allocate(
+            shape, dtype, fmt, purpose="preload"
+        )
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array

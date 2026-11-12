@@ -1103,7 +1103,28 @@ class LMCacheConnectorV1Impl:
             return 0
         if layerwise:
             num_chunks *= max(int(self.num_layers), 1)
-        return int(pre_evict(num_chunks))
+        slot_bytes = self._store_slot_bytes()
+        # Byte sum of this step, plus one chunk. store() allocates one chunk
+        # at a time, so the span that must exist is a single aligned chunk.
+        # The returned count is how many chunks fit in the longest free span.
+        need_bytes = num_chunks * slot_bytes if slot_bytes > 0 else 0
+        return int(pre_evict(num_chunks, need_bytes, slot_bytes))
+
+    def _store_slot_bytes(self) -> int:
+        """Aligned bytes of one store chunk. Zero when the backend cannot say."""
+        engine = self.lmcache_engine
+        if engine is None:
+            return 0
+        manager = getattr(engine, "storage_manager", None)
+        backend = getattr(manager, "allocator_backend", None)
+        slot_bytes = getattr(backend, "aligned_store_slot_bytes", None)
+        if not callable(slot_bytes):
+            return 0
+        try:
+            return int(slot_bytes() or 0)
+        except Exception:
+            logger.debug("aligned store slot size is unavailable", exc_info=True)
+            return 0
 
     @_lmcache_nvtx_annotate
     def save_kv_layer(
@@ -1346,6 +1367,8 @@ class LMCacheConnectorV1Impl:
             slots = self._aligned_slots_for_save(request, layerwise=False)
             if slots <= 0:
                 continue
+            # free_slots is the longest contiguous span, not the sum of holes.
+            # A request that does not fit in that span is skipped whole.
             if slots > free_slots:
                 logger.info(
                     "Dropping KV for request %s: need %d aligned slots, "

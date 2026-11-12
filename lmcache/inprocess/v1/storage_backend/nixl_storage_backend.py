@@ -976,13 +976,19 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         if busy_loop:
             logger.warning("NixlStorageBackend does not support busy loop for now")
 
         if self._local_cpu_backend is not None:
             return self._local_cpu_backend.allocate(
-                shapes, dtypes, fmt, eviction=eviction, busy_loop=False
+                shapes,
+                dtypes,
+                fmt,
+                eviction=eviction,
+                busy_loop=False,
+                purpose=purpose,
             )
         return self.memory_allocator.allocate(shapes, dtypes, fmt)
 
@@ -994,13 +1000,20 @@ class NixlStorageBackend(AllocatorBackendInterface, ABC):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[list[MemoryObj]]:
         if busy_loop:
             logger.warning("NixlStorageBackend does not support busy loop for now")
 
         if self._local_cpu_backend is not None:
             return self._local_cpu_backend.batched_allocate(
-                shapes, dtypes, batch_size, fmt, eviction=eviction, busy_loop=False
+                shapes,
+                dtypes,
+                batch_size,
+                fmt,
+                eviction=eviction,
+                busy_loop=False,
+                purpose=purpose,
             )
         return self.memory_allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 

@@ -360,6 +360,7 @@ class AllocatorBackendInterface(StorageBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """
         Allocates memory in the backend to hold a tensor of the given shape.
@@ -390,6 +391,7 @@ class AllocatorBackendInterface(StorageBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[list[MemoryObj]]:
         """
         Allocates memory in the backend to hold a tensor of the given shape

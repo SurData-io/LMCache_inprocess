@@ -45,6 +45,12 @@ logger = init_logger(__name__)
 # This bench is 8192 / 256 = 32. The cap is that step limit, not a new config key.
 STORE_PREEVICT_CHUNK_CAP = 32
 
+# Same integers as surdata_vllm.config.STORE_POOL_DEFAULT / PRELOAD_POOL_DEFAULT.
+# A max_local_cpu_size of exactly 20 uses these two pools. Host MemTotal,
+# MemAvailable, KV HBM, and OOM logs do not change them.
+STORE_POOL_BYTES = 8589934592
+PRELOAD_POOL_BYTES = 12884901888
+
 
 def aligned_savable_tokens(
     token_count: int,
@@ -128,6 +134,32 @@ def aligned_free_slot_count(free_blocks, aligned_bytes: int) -> int:
     return slots
 
 
+def largest_contiguous_slot_count(free_blocks, aligned_bytes: int) -> int:
+    """Chunks that fit in the single longest free span.
+
+    Admission uses this, not the sum of every fragment. A hole smaller than
+    one aligned chunk counts as zero. Two holes of three chunks admit three,
+    not six, because the next ``allocate`` needs one contiguous chunk and a
+    request is skipped before D2H when that span cannot hold it.
+    """
+    if aligned_bytes <= 0:
+        return 0
+    largest = 0
+    for block in free_blocks:
+        size = int(getattr(block, "size", 0) or 0)
+        if size >= aligned_bytes:
+            largest = max(largest, size // aligned_bytes)
+    return largest
+
+
+def free_address_bytes(free_blocks) -> int:
+    """Sum of free address-block sizes. Fragments are included."""
+    total = 0
+    for block in free_blocks:
+        total += int(getattr(block, "size", 0) or 0)
+    return total
+
+
 def _chunk_size_bytes(shapes, dtypes) -> int:
     """Bytes of one KV chunk. Imported lazily so store pre-evict can load
     without the vLLM KV-format registry, which asks for native symbols.
@@ -165,11 +197,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # test compatibility
         # TODO: fix the tests to get rid the memory allocator
         assert metadata is not None or memory_allocator is not None
+        # initialize_allocator sets these when the 20GiB default pool is split.
+        self._split_pools = False
         self.memory_allocator = (
             self.initialize_allocator(config, metadata)  # type: ignore
             if memory_allocator is None
             else memory_allocator
         )
+        if not hasattr(self, "preload_allocator"):
+            self.preload_allocator = self.memory_allocator
+        # Injected tests and P2P/NIXL/io_uring keep one allocator. purpose is
+        # then a no-op: store and preload allocate from the same object.
+        self.store_allocator = self.memory_allocator
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
@@ -661,20 +700,30 @@ class LocalCPUBackend(AllocatorBackendInterface):
                     **kwargs,
                 )
 
-            # Default: use non-paged allocator
+            # Default: use non-paged allocator. Exactly 20GiB is SurData's
+            # two direct pools (8GiB store, 12GiB preload). P2P, NIXL, and
+            # io_uring returned above and stay a single allocator.
+            pool_kwargs: dict[str, Any] = {
+                "numa_mapping": numa_mapping,
+                "use_hugepages": use_hugepages,
+            }
             if allocator_align_bytes is not None:
-                return MixedMemoryAllocator(
-                    cpu_size_bytes,
-                    numa_mapping=numa_mapping,
-                    align_bytes=allocator_align_bytes,
-                    use_hugepages=use_hugepages,
+                pool_kwargs["align_bytes"] = allocator_align_bytes
+            else:
+                pool_kwargs["config"] = config
+            if cpu_size_bytes == STORE_POOL_BYTES + PRELOAD_POOL_BYTES:
+                logger.info(
+                    "LocalCPUBackend: 20GiB hot cache split into store %d "
+                    "bytes and preload %d bytes",
+                    STORE_POOL_BYTES,
+                    PRELOAD_POOL_BYTES,
                 )
-            return MixedMemoryAllocator(
-                cpu_size_bytes,
-                numa_mapping=numa_mapping,
-                config=config,
-                use_hugepages=use_hugepages,
-            )
+                self._split_pools = True
+                self.preload_allocator = MixedMemoryAllocator(
+                    PRELOAD_POOL_BYTES, **pool_kwargs
+                )
+                return MixedMemoryAllocator(STORE_POOL_BYTES, **pool_kwargs)
+            return MixedMemoryAllocator(cpu_size_bytes, **pool_kwargs)
 
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
@@ -746,6 +795,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """
         Allocate a memory object of shape and dtype
@@ -766,7 +816,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         (we use the async serializer to handle this)
         """
         logger.debug(
-            "Allocating memory in local cpu backend with busy loop: %s", busy_loop
+            "Allocating memory in local cpu backend with busy loop: %s purpose: %s",
+            busy_loop,
+            purpose,
         )
         if fmt is None:
             if self.layerwise:
@@ -777,7 +829,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+        allocator = self._allocator_for(purpose)
+        memory_obj = allocator.allocate(shapes, dtypes, fmt)
         if memory_obj is not None or not eviction:
             return memory_obj
 
@@ -792,9 +845,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 num_candidates = 1
                 evict_keys = None
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
+                    evict_keys = self._evict_keys(allocator, num_candidates)
                     if evict_keys:
                         # we can continue trying to evict from the hot_cache
                         # and don't need to wait for other requests yet
@@ -829,7 +880,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            memory_obj = allocator.allocate(shapes, dtypes, fmt)
             if memory_obj is not None:
                 break
 
@@ -883,80 +934,178 @@ class LocalCPUBackend(AllocatorBackendInterface):
             align = getattr(address_manager, "_align", None)
         return aligned_slot_bytes(chunk_bytes, int(align or 1))
 
-    def _aligned_free_slots(self, aligned_bytes: int) -> Optional[int]:
-        """Aligned chunks that fit in contiguous free address blocks.
+    def _store_pool(self):
+        """Allocator D2H allocates from. One allocator when pools are not split."""
+        if self._split_pools:
+            return self.store_allocator
+        return self.memory_allocator
 
-        ``None`` means the allocator does not expose its free list. Callers
-        treat that as no room and skip the D2H.
+    def _allocator_for(self, purpose: str):
+        """Pick the pool for this allocate. One allocator ignores purpose."""
+        if not self._split_pools:
+            return self.memory_allocator
+        if purpose == "preload":
+            return self.preload_allocator
+        return self.store_allocator
+
+    def _obj_in_allocator(self, memory_obj, allocator) -> bool:
+        """True when this hot-cache object lives in ``allocator``.
+
+        A single allocator owns every object. Split pools compare
+        ``parent_allocator``, which MixedMemoryAllocator sets at allocate.
         """
-        if aligned_bytes <= 0:
-            return None
-        allocator = self.memory_allocator
+        if not self._split_pools:
+            return True
+        return getattr(memory_obj, "parent_allocator", None) is allocator
+
+    def _evict_keys(self, allocator, num_candidates: int) -> list:
+        """Evictable hot-cache keys whose memory is in ``allocator``.
+
+        In-flight disk writes have ref_count greater than 1, so ``can_evict``
+        is false and they stay. The other pool is not a victim source.
+        """
+        if num_candidates <= 0:
+            return []
+        if not self._split_pools:
+            return self.cache_policy.get_evict_candidates(
+                self.hot_cache, num_candidates=num_candidates
+            )
+        picked = []
+        for key, memory_obj in self.hot_cache.items():
+            if not memory_obj.can_evict:
+                continue
+            if not self._obj_in_allocator(memory_obj, allocator):
+                continue
+            picked.append(key)
+            if len(picked) >= num_candidates:
+                break
+        return picked
+
+    def _read_free_blocks(self, allocator):
+        """Free address list, or None when this allocator does not expose one."""
         pin = getattr(allocator, "pin_allocator", allocator)
         address_manager = getattr(pin, "address_manager", None)
         free_blocks = getattr(address_manager, "_explicit_list", None)
         if free_blocks is None:
+            return None, None
+        return free_blocks, getattr(address_manager, "_lock", None)
+
+    def _pool_free_stats(
+        self, allocator, aligned_bytes: int
+    ) -> Optional[tuple[int, int]]:
+        """``(free_bytes, longest_span_slots)`` for one pool.
+
+        ``None`` means the free list is hidden. A span shorter than one
+        aligned chunk contributes zero slots.
+        """
+        free_blocks, lock = self._read_free_blocks(allocator)
+        if free_blocks is None:
             return None
-        lock = getattr(address_manager, "_lock", None)
+
+        def _read() -> tuple[int, int]:
+            return (
+                free_address_bytes(free_blocks),
+                largest_contiguous_slot_count(free_blocks, aligned_bytes),
+            )
+
+        if lock is None:
+            return _read()
+        with lock:
+            return _read()
+
+    def aligned_store_slot_bytes(self) -> int:
+        """One store chunk, aligned. Zero when the size cannot be known."""
+        size = self._aligned_slot_bytes()
+        if size is None or size <= 0:
+            return 0
+        return int(size)
+
+    def _aligned_free_slots(self, aligned_bytes: int) -> Optional[int]:
+        """Sum of aligned chunks across free spans of the store pool.
+
+        ``None`` means the allocator does not expose its free list. Callers
+        treat that as no room and skip the D2H. Admission uses the longest
+        span instead of this sum.
+        """
+        if aligned_bytes <= 0:
+            return None
+        free_blocks, lock = self._read_free_blocks(self._store_pool())
+        if free_blocks is None:
+            return None
         if lock is None:
             return aligned_free_slot_count(free_blocks, aligned_bytes)
         with lock:
             return aligned_free_slot_count(free_blocks, aligned_bytes)
 
     @_lmcache_nvtx_annotate
-    def ensure_free_chunks(self, num_chunks: int) -> int:
-        """Evict what the hot cache can spare, then report aligned free slots.
+    def ensure_free_chunks(
+        self,
+        num_chunks: int,
+        need_bytes: int = 0,
+        span_bytes: int = 0,
+    ) -> int:
+        """Reclaim the store pool until this step's watermark is met.
 
-        ``num_chunks`` is the batch's aligned slot demand. Already-free
-        aligned slots are kept. Only the shortfall is dropped, and only from
-        objects ``can_evict`` allows. Pinned objects and in-flight disk
-        writes stay. Returns how many aligned slots are free after that
-        pass, which may be less than ``num_chunks``. No sleep and no
-        per-chunk retry. A missing free list returns 0.
+        ``need_bytes`` is the byte sum of the chunks this step still wants to
+        D2H. ``span_bytes`` is one aligned chunk, because ``store`` allocates
+        one chunk at a time. Reclaim stops when free bytes cover ``need_bytes``
+        and the longest free span is at least one chunk. Victims are
+        ``can_evict`` objects in the store pool only. Pinned objects and
+        in-flight disk writes stay. Returns how many chunks fit in the longest
+        remaining span, which may be less than ``num_chunks``. No sleep.
+        A missing free list returns 0.
         """
         if not self.use_hot:
             return 0
         aligned_bytes = self._aligned_slot_bytes()
         if aligned_bytes is None:
             return 0
-        free_slots = self._aligned_free_slots(aligned_bytes)
-        if free_slots is None:
-            return 0
-        need = num_chunks - free_slots
-        if need <= 0:
-            return free_slots
+        if span_bytes <= 0:
+            span_bytes = aligned_bytes
+        if need_bytes <= 0 and num_chunks > 0:
+            need_bytes = num_chunks * aligned_bytes
 
+        store_pool = self._store_pool()
         evicted = 0
-        with self.cpu_lock:
-            while evicted < need:
-                remaining = need - evicted
-                evict_keys = self.cache_policy.get_evict_candidates(
-                    self.hot_cache,
-                    num_candidates=min(64, remaining),
+        while True:
+            stats = self._pool_free_stats(store_pool, aligned_bytes)
+            if stats is None:
+                return 0
+            free_bytes, largest_slots = stats
+            largest_bytes = largest_slots * aligned_bytes
+            if free_bytes >= need_bytes and largest_bytes >= span_bytes:
+                break
+            with self.cpu_lock:
+                evict_keys = self._evict_keys(
+                    store_pool, min(64, max(1, num_chunks or 1))
                 )
                 if not evict_keys:
-                    self.stats_monitor.update_local_cpu_evict_failed_count(remaining)
+                    self.stats_monitor.update_local_cpu_evict_failed_count(
+                        max(num_chunks, 1)
+                    )
                     break
                 # force=False keeps lookup pins. can_evict already skipped
                 # pinned and in-flight objects, and remove() does not take
                 # cpu_lock again when force is false.
                 removed = self.batched_remove(evict_keys, force=False)
-                if removed <= 0:
-                    self.stats_monitor.update_local_cpu_evict_failed_count(remaining)
-                    break
-                evicted += removed
+            if removed <= 0:
+                self.stats_monitor.update_local_cpu_evict_failed_count(
+                    max(num_chunks, 1)
+                )
+                break
+            evicted += removed
 
         if evicted:
             self.stats_monitor.update_local_cpu_evict_metrics(evicted)
             logger.debug(
-                "Pre-evicted %d chunks from local cpu hot cache for a %d slot store",
+                "Pre-evicted %d chunks from the store pool for a %d slot store",
                 evicted,
                 num_chunks,
             )
-        free_after = self._aligned_free_slots(aligned_bytes)
-        if free_after is None:
+        stats = self._pool_free_stats(store_pool, aligned_bytes)
+        if stats is None:
             return 0
-        return free_after
+        return stats[1]
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
@@ -967,6 +1116,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         fmt: Optional[MemoryFormat] = None,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[List[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
@@ -987,8 +1137,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
         (we use the async serializer to handle this)
         """
         logger.debug(
-            "Batched allocating memory in local cpu backend with busy loop: %s",
+            "Batched allocating memory in local cpu backend with busy loop: %s "
+            "purpose: %s",
             busy_loop,
+            purpose,
         )
         if fmt is None:
             if self.layerwise:
@@ -999,14 +1151,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else:
                 fmt = MemoryFormat.KV_2LTD
 
-        memory_objs = self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt
-        )
+        allocator = self._allocator_for(purpose)
+        memory_objs = allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
 
         if memory_objs is not None or not eviction:
             return memory_objs
 
-        assert isinstance(self.memory_allocator, MixedMemoryAllocator)
+        assert isinstance(allocator, MixedMemoryAllocator)
 
         evict_keys_count = 0
         num_attempts = 0
@@ -1018,9 +1169,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 num_candidates = min(64, max(1, len(self.hot_cache)))
                 evict_keys = None
                 with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
+                    evict_keys = self._evict_keys(allocator, num_candidates)
 
                     # HACK: We assume batch_size=num_layers here.
                     # FIXME: We also assume if the one layer's ref_count > 1 or pinned,
@@ -1036,7 +1185,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                             old_mem_objs: list[MemoryObj] = []
                             for key in evict_key_all_layer:
                                 old_mem_obj = self.hot_cache.get(key)
-                                if old_mem_obj is None or not old_mem_obj.can_evict:
+                                if (
+                                    old_mem_obj is None
+                                    or not old_mem_obj.can_evict
+                                    or not self._obj_in_allocator(old_mem_obj, allocator)
+                                ):
                                     old_mem_objs = []
                                     break
                                 old_mem_objs.append(old_mem_obj)
@@ -1050,7 +1203,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
 
-                            self.memory_allocator.batched_free(old_mem_objs)
+                            allocator.batched_free(old_mem_objs)
 
                             logger.debug(
                                 "Evicting %d chunks from cpu memory", len(old_mem_objs)
@@ -1080,9 +1233,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 # do not hold the lock during sleep
                 time.sleep(time_to_wait)
 
-            memory_objs = self.memory_allocator.batched_allocate(
-                shapes, dtypes, batch_size, fmt
-            )
+            memory_objs = allocator.batched_allocate(shapes, dtypes, batch_size, fmt)
             if memory_objs is not None:
                 break
 
@@ -1202,5 +1353,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
-        self.memory_allocator.close()
+        closed: set[int] = set()
+        for alloc in (
+            getattr(self, "memory_allocator", None),
+            getattr(self, "store_allocator", None),
+            getattr(self, "preload_allocator", None),
+        ):
+            if alloc is None or id(alloc) in closed:
+                continue
+            closed.add(id(alloc))
+            closer = getattr(alloc, "close", None)
+            if callable(closer):
+                closer()
         self.clear()

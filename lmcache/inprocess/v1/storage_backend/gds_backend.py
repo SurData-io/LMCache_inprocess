@@ -1184,10 +1184,12 @@ class GdsBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """
         Allocate a memory object of shape and dtype
         """
+        del purpose
         if eviction:
             logger.warning("GDS Backend does not support eviction")
 
@@ -1234,10 +1236,12 @@ class GdsBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[list[MemoryObj]]:
         """
         Batched allocate `batch_size` memory objects of shape and dtype
         """
+        del purpose
         if eviction:
             logger.warning("GDS Backend does not support eviction")
 

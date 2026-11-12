@@ -537,8 +537,12 @@ class PDBackendAsync(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """Allocate a single memory object from the PD buffer.
+
+        ``purpose`` is accepted so the storage manager can name the pool.
+        This backend has one allocator and ignores it.
 
         For the sender role, this method enforces staging buffer flow control:
         it blocks until inflight chunks drop below the threshold, then attempts
@@ -604,8 +608,12 @@ class PDBackendAsync(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ):
         """Allocate a batch of memory objects from the PD buffer.
+
+        ``purpose`` is accepted so the storage manager can name the pool.
+        This backend has one allocator and ignores it.
 
         Delegates directly to the underlying memory allocator without sender
         flow control. Currently a thin wrapper; see the TODO for planned

@@ -189,8 +189,11 @@ class MaruBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[MemoryObj]:
         """Allocate CXL-backed memory via CxlMemoryAdapter.
+
+        ``purpose`` is ignored. Maru has one allocator.
 
         Args:
             shapes: Tensor shape(s).
@@ -220,8 +223,11 @@ class MaruBackend(AllocatorBackendInterface):
         fmt: MemoryFormat = MemoryFormat.KV_2LTD,
         eviction: bool = True,
         busy_loop: bool = True,
+        purpose: str = "store",
     ) -> Optional[list[MemoryObj]]:
         """Allocate multiple CXL-backed MemoryObjs.
+
+        ``purpose`` is ignored. Maru has one allocator.
 
         Args:
             shapes: Tensor shape(s) (same for each allocation).
