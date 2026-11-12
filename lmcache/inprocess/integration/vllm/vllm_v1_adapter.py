@@ -1104,9 +1104,8 @@ class LMCacheConnectorV1Impl:
         if layerwise:
             num_chunks *= max(int(self.num_layers), 1)
         slot_bytes = self._store_slot_bytes()
-        # Byte sum of this step, plus one chunk. store() allocates one chunk
-        # at a time, so the span that must exist is a single aligned chunk.
-        # The returned count is how many chunks fit in the longest free span.
+        # slot_bytes is one chunk. store() allocates one chunk at a time, so
+        # holes add. The returned count is how many such allocations fit.
         need_bytes = num_chunks * slot_bytes if slot_bytes > 0 else 0
         return int(pre_evict(num_chunks, need_bytes, slot_bytes))
 
@@ -1169,7 +1168,7 @@ class LMCacheConnectorV1Impl:
 
         # store_layer allocates on the first visit. Unpin first so lookup
         # pins do not hide evictable chunks, then keep only requests that
-        # fit in the slots that eviction could actually free.
+        # fit in the one-chunk slots eviction could actually free.
         first_pass = any(
             self._layerwise_save_storers.get(request.req_id) is None
             for request in connector_metadata.requests
@@ -1367,8 +1366,9 @@ class LMCacheConnectorV1Impl:
             slots = self._aligned_slots_for_save(request, layerwise=False)
             if slots <= 0:
                 continue
-            # free_slots is the longest contiguous span, not the sum of holes.
-            # A request that does not fit in that span is skipped whole.
+            # free_slots counts one-chunk allocations across holes. A hole
+            # smaller than one chunk is zero. The whole request is skipped
+            # when fewer than that many allocations fit.
             if slots > free_slots:
                 logger.info(
                     "Dropping KV for request %s: need %d aligned slots, "

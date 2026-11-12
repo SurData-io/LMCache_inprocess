@@ -390,12 +390,12 @@ class LMCacheEngine:
     ) -> int:
         """Reclaim the store pool before this step's stores allocate.
 
-        ``num_chunks`` is the aligned slot demand. ``need_bytes`` is that
-        demand in bytes. ``span_bytes`` is one aligned chunk. Eviction is
-        best-effort and only takes store-pool objects that ``can_evict``.
-        Returns how many chunks fit in the longest free span afterwards.
-        A caller that still cannot fit one request skips that store and does
-        not copy KV off the GPU.
+        ``num_chunks`` is how many one-chunk allocations this step still needs.
+        ``span_bytes`` is the size of one chunk. Eviction is best-effort and
+        only takes store-pool objects that ``can_evict``. Returns how many
+        one-chunk allocations fit afterwards, summed across holes. A caller
+        that still cannot fit one request skips that store and does not copy
+        KV off the GPU.
         """
         if self.storage_manager is None:
             return 0

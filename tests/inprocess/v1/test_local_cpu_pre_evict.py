@@ -205,8 +205,8 @@ def test_ensure_free_chunks_does_not_evict_when_slots_are_free():
         LMCStatsMonitor.DestroyInstance()
 
 
-def test_largest_contiguous_slot_count_is_not_the_sum_of_holes():
-    """Two holes that each hold three chunks admit three, not six."""
+def test_allocatable_slots_add_holes_and_ignore_fragments():
+    """Two holes of three chunks are six slots. A fragment smaller than one is zero."""
     aligned = 8192
     blocks = [
         _FreeBlock(aligned * 3),
@@ -215,8 +215,8 @@ def test_largest_contiguous_slot_count_is_not_the_sum_of_holes():
     ]
     assert aligned_free_slot_count(blocks, aligned) == 6
     assert largest_contiguous_slot_count(blocks, aligned) == 3
-    assert largest_contiguous_slot_count([_FreeBlock(aligned - 1)], aligned) == 0
-    assert largest_contiguous_slot_count(blocks, 0) == 0
+    assert aligned_free_slot_count([_FreeBlock(aligned - 1)], aligned) == 0
+    assert aligned_free_slot_count(blocks, 0) == 0
 
 
 def test_pool_sizes_match_surdata_direct_pools():
@@ -327,17 +327,17 @@ def test_inflight_store_is_not_reclaimed_by_the_watermark():
         LMCStatsMonitor.DestroyInstance()
 
 
-def test_fragmented_free_bytes_do_not_admit_a_full_request():
-    """Enough total free bytes, but no span holds the request. Admission is short.
+def test_one_chunk_holes_add_up_and_admit_eight_allocs():
+    """Separate one-chunk holes add. Eight later allocations fit without eviction.
 
     Every other chunk is freed and the rest are pinned, so the holes cannot
-    be merged or reclaimed. The longest span is what wait_for_save compares
-    with the request. A request of 8 chunks is not started.
+    be merged. ``store`` still allocates one chunk at a time, so the sum of
+    those holes is the admission count.
     """
     backend, allocator = _backend(2 * 1024 * 1024)
     try:
         resident = _fill(backend)
-        assert len(resident) >= 8
+        assert len(resident) >= 16
         for key in resident[::2]:
             assert backend.remove(key, force=True)
         for key in resident[1::2]:
@@ -345,10 +345,18 @@ def test_fragmented_free_bytes_do_not_admit_a_full_request():
         aligned = backend.aligned_store_slot_bytes()
         assert aligned > 0
         summed = backend._aligned_free_slots(aligned)
-        span = backend.ensure_free_chunks(8)
-        assert summed is not None
-        assert summed > span
-        assert span < 8
+        slots = backend.ensure_free_chunks(8)
+        assert summed is not None and summed >= 8
+        assert slots == summed
+        held = []
+        for _ in range(8):
+            memory_obj = backend.allocate(
+                _SHAPE, _DTYPE, eviction=False, purpose="store"
+            )
+            assert memory_obj is not None
+            held.append(memory_obj)
+        for memory_obj in held:
+            memory_obj.ref_count_down()
         for key in resident[1::2]:
             assert key in backend.hot_cache
     finally:
@@ -356,8 +364,25 @@ def test_fragmented_free_bytes_do_not_admit_a_full_request():
         LMCStatsMonitor.DestroyInstance()
 
 
-def test_watermark_reclaim_admits_store_when_the_span_fits():
-    """After reclaim, store() can take a request that fits in the longest span."""
+def test_seven_free_chunks_keep_evicting_until_eight():
+    """Seven free slots are short of an eight-slot step, so eviction continues."""
+    backend, allocator = _backend(2 * 1024 * 1024)
+    try:
+        resident = _fill(backend)
+        assert len(resident) >= 8
+        for key in resident[:7]:
+            assert backend.remove(key, force=True)
+        before = len(backend.hot_cache)
+        slots = backend.ensure_free_chunks(8)
+        assert slots >= 8
+        assert len(backend.hot_cache) < before
+    finally:
+        allocator.close()
+        LMCStatsMonitor.DestroyInstance()
+
+
+def test_watermark_reclaim_admits_store_when_the_slots_fit():
+    """After reclaim, later one-chunk allocations fit in the returned slot count."""
     backend, allocator = _backend(2 * 1024 * 1024)
     try:
         resident = _fill(backend)

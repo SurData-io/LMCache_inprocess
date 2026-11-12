@@ -137,10 +137,9 @@ def aligned_free_slot_count(free_blocks, aligned_bytes: int) -> int:
 def largest_contiguous_slot_count(free_blocks, aligned_bytes: int) -> int:
     """Chunks that fit in the single longest free span.
 
-    Admission uses this, not the sum of every fragment. A hole smaller than
-    one aligned chunk counts as zero. Two holes of three chunks admit three,
-    not six, because the next ``allocate`` needs one contiguous chunk and a
-    request is skipped before D2H when that span cannot hold it.
+    A hole smaller than one aligned chunk counts as zero. Admission does not
+    use this. ``store`` allocates one chunk at a time, so two holes of three
+    chunks are six allocatable slots.
     """
     if aligned_bytes <= 0:
         return 0
@@ -992,20 +991,23 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     def _pool_free_stats(
         self, allocator, aligned_bytes: int
-    ) -> Optional[tuple[int, int]]:
-        """``(free_bytes, longest_span_slots)`` for one pool.
+    ) -> Optional[tuple[int, int, int]]:
+        """``(free_bytes, longest_span_slots, allocatable_slots)`` for one pool.
 
-        ``None`` means the free list is hidden. A span shorter than one
-        aligned chunk contributes zero slots.
+        ``None`` means the free list is hidden. A hole smaller than one
+        aligned chunk adds bytes but zero allocatable slots. Allocatable
+        slots are the sum across holes, because ``store`` takes one chunk
+        at a time.
         """
         free_blocks, lock = self._read_free_blocks(allocator)
         if free_blocks is None:
             return None
 
-        def _read() -> tuple[int, int]:
+        def _read() -> tuple[int, int, int]:
             return (
                 free_address_bytes(free_blocks),
                 largest_contiguous_slot_count(free_blocks, aligned_bytes),
+                aligned_free_slot_count(free_blocks, aligned_bytes),
             )
 
         if lock is None:
@@ -1024,8 +1026,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """Sum of aligned chunks across free spans of the store pool.
 
         ``None`` means the allocator does not expose its free list. Callers
-        treat that as no room and skip the D2H. Admission uses the longest
-        span instead of this sum.
+        treat that as no room and skip the D2H. Admission uses this sum.
+        A hole smaller than one aligned chunk contributes nothing.
         """
         if aligned_bytes <= 0:
             return None
@@ -1044,36 +1046,36 @@ class LocalCPUBackend(AllocatorBackendInterface):
         need_bytes: int = 0,
         span_bytes: int = 0,
     ) -> int:
-        """Reclaim the store pool until this step's watermark is met.
+        """Reclaim the store pool until this step has enough chunk slots.
 
-        ``need_bytes`` is the byte sum of the chunks this step still wants to
-        D2H. ``span_bytes`` is one aligned chunk, because ``store`` allocates
-        one chunk at a time. Reclaim stops when free bytes cover ``need_bytes``
-        and the longest free span is at least one chunk. Victims are
-        ``can_evict`` objects in the store pool only. Pinned objects and
-        in-flight disk writes stay. Returns how many chunks fit in the longest
-        remaining span, which may be less than ``num_chunks``. No sleep.
-        A missing free list returns 0.
+        ``span_bytes`` is one aligned chunk. ``store`` allocates one chunk at
+        a time, so a slot is one hole of at least that size, and several holes
+        add. Reclaim continues while the sum of those slots is below
+        ``num_chunks``. Raw free bytes are not the stop condition: a 7-chunk
+        hole plus fragments still short of the budget keeps evicting.
+        Victims are ``can_evict`` objects in the store pool only. Pinned
+        objects and in-flight disk writes stay. Returns how many one-chunk
+        allocations fit afterwards, which may be less than ``num_chunks``.
+        No sleep. A missing free list returns 0.
         """
+        del need_bytes
         if not self.use_hot:
             return 0
         aligned_bytes = self._aligned_slot_bytes()
         if aligned_bytes is None:
             return 0
-        if span_bytes <= 0:
-            span_bytes = aligned_bytes
-        if need_bytes <= 0 and num_chunks > 0:
-            need_bytes = num_chunks * aligned_bytes
+        # One slot is one chunk. The caller's span is that size when known.
+        slot_bytes = span_bytes if span_bytes > 0 else aligned_bytes
 
         store_pool = self._store_pool()
         evicted = 0
+        slot_count = 0
         while True:
-            stats = self._pool_free_stats(store_pool, aligned_bytes)
+            stats = self._pool_free_stats(store_pool, slot_bytes)
             if stats is None:
                 return 0
-            free_bytes, largest_slots = stats
-            largest_bytes = largest_slots * aligned_bytes
-            if free_bytes >= need_bytes and largest_bytes >= span_bytes:
+            _free_bytes, _largest_slots, slot_count = stats
+            if num_chunks <= 0 or slot_count >= num_chunks:
                 break
             with self.cpu_lock:
                 evict_keys = self._evict_keys(
@@ -1102,10 +1104,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 evicted,
                 num_chunks,
             )
-        stats = self._pool_free_stats(store_pool, aligned_bytes)
+        stats = self._pool_free_stats(store_pool, slot_bytes)
         if stats is None:
             return 0
-        return stats[1]
+        return stats[2]
 
     @_lmcache_nvtx_annotate
     def batched_allocate(
