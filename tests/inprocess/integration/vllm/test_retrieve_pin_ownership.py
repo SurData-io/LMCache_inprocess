@@ -486,7 +486,12 @@ def test_async_cleanup_releases_one_prefetch_pin(
     completion: Literal["retrieve", "cancel"],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Async cleanup keeps an external pin and accepts unpinned backend results.
+    """One prefetch is released once, by retrieve or by an abort cleanup.
+
+    Retrieve pops the loading event and drops its own references. A later
+    ``lookup_unpin`` is what ``wait_for_save`` does, and it must not drop
+    them again. An abort calls ``cleanup_memory_objs``; a second call finds
+    nothing left to release.
 
     Args:
         cache_case: Three CPU objects returned through a real completed event.
@@ -509,11 +514,11 @@ def test_async_cleanup_releases_one_prefetch_pin(
 
     if completion == "retrieve":
         assert engine.retrieve(cache_case.tokens, req_id="A").all()
-        # Successful retrieve retains the event record. Remove only the record,
-        # not its already-consumed references; aborted lookups use lookup_unpin.
-        engine.event_manager.pop_event(EventType.LOADING, "A")
-    else:
         engine.lookup_unpin("A")
+        engine.cleanup_memory_objs("A")
+    else:
+        engine.cleanup_memory_objs("A")
+        engine.cleanup_memory_objs("A")
         engine.lookup_unpin("A")
 
     _assert_counts(cache_case.memory_objs, [0, 0, 1])

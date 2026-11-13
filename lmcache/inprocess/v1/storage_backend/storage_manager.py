@@ -26,7 +26,12 @@ import torch
 from lmcache import torch_dev, torch_device_type
 from lmcache.inprocess.observability import PrometheusLogger
 from lmcache.inprocess.v1.config import LMCacheEngineConfig
-from lmcache.inprocess.v1.event_manager import EventManager, EventStatus, EventType
+from lmcache.inprocess.v1.event_manager import (
+    LOADING_EPOCH_ATTR,
+    EventManager,
+    EventStatus,
+    EventType,
+)
 from lmcache.inprocess.v1.metadata import LMCacheMetadata
 from lmcache.inprocess.v1.storage_backend import CreateStorageBackends, is_cuda_worker
 from lmcache.inprocess.v1.storage_backend.abstract_backend import (
@@ -950,6 +955,7 @@ class StorageManager:
                 ]
 
             all_done = asyncio.create_task(gather_with_keys())
+            setattr(all_done, LOADING_EPOCH_ATTR, int(epoch))
             # Register the event before adding the callback to avoid race conditions
             self.event_manager.add_event(
                 EventType.LOADING,
@@ -1205,6 +1211,7 @@ class StorageManager:
             ]
 
         all_done = asyncio.create_task(gather_with_keys())
+        setattr(all_done, LOADING_EPOCH_ATTR, int(load.epoch))
         self.event_manager.add_event(EventType.LOADING, lookup_id, all_done)
         all_done.add_done_callback(
             lambda future: self.prefetch_all_done_callback(

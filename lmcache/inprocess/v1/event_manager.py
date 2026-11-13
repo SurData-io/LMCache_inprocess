@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from enum import Enum, auto
+from typing import Optional
 import asyncio
 import threading
+
+# Attribute stamped on a LOADING future. Cleanup releases the buffers only
+# when this is absent or equal to the cleanup epoch.
+LOADING_EPOCH_ATTR = "lmcache_epoch"
 
 
 class EventType(Enum):
@@ -125,13 +130,44 @@ class EventManager:
                 return 0
             return len(status_dict[status])
 
+    def pop_event_if_done(
+        self,
+        event_type: EventType,
+        event_id: str,
+        epoch: Optional[int] = None,
+    ) -> Optional[asyncio.Future]:
+        """Pop a DONE event, or leave it and return None.
+
+        ``epoch`` None takes whatever is done. A finished prefetch and the
+        cleanup that should release it then cannot both hold the future.
+        When ``epoch`` is set and the future carries a different
+        ``lmcache_epoch``, the event stays. A future with no epoch is
+        eligible for any caller, which is the unstamped path.
+        """
+        with self.lock:
+            status_dict = self.events.get(event_type, None)
+            if status_dict is None:
+                return None
+            done_events = status_dict[EventStatus.DONE]
+            future = done_events.get(event_id)
+            if future is None:
+                return None
+            stamped = getattr(future, LOADING_EPOCH_ATTR, None)
+            if (
+                epoch is not None
+                and stamped is not None
+                and int(stamped) != int(epoch)
+            ):
+                return None
+            return done_events.pop(event_id)
+
     def get_event_future(
         self,
         event_type: EventType,
         event_id: str,
     ) -> asyncio.Future:
         """
-        Pop and return the event with the given type and id.
+        Return the DONE event without removing it.
         """
         with self.lock:
             status_dict = self.events.get(event_type, None)

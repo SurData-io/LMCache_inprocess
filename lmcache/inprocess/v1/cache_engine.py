@@ -1502,16 +1502,17 @@ class LMCacheEngine:
                         lookup_id,
                         exc_info=True,
                     )
-            # Get the completed future from event_manager
-            if (
-                self.event_manager.get_event_status(EventType.LOADING, lookup_id)
-                != EventStatus.DONE
-            ):
+            # One owner pops the future. A different epoch leaves it for the
+            # retrieve that was already admitted. No epoch on the future keeps
+            # the previous cleanup behavior.
+            future = self.event_manager.pop_event_if_done(
+                EventType.LOADING, lookup_id, epoch=int(epoch)
+            )
+            if future is None:
                 logger.debug(
                     "No completed event found for lookup_id=%s to clean up.", lookup_id
                 )
                 return
-            future = self.event_manager.pop_event(EventType.LOADING, lookup_id)
 
             # Get memory objects from the future result
             memory_objs = future.result()
@@ -1665,12 +1666,9 @@ class LMCacheEngine:
             for location, keys in self.lookup_pins.pop(lookup_id).items():
                 self.storage_manager.batched_unpin(keys, [location])
 
-        elif (
-            self.async_loading is not None
-            and self.event_manager.get_event_status(EventType.LOADING, lookup_id)
-            != EventStatus.NOT_FOUND
-        ):
-            self.cleanup_memory_objs(lookup_id)
+        # A LOADING event still here belongs to a prefetch this step did not
+        # retrieve. wait_for_save runs after H2D and must not free those
+        # buffers. Abort releases them through cleanup_memory_objs.
 
     @_lmcache_nvtx_annotate
     def clear(
@@ -1781,9 +1779,17 @@ class LMCacheEngine:
 
         tot_kv_size = 0
         chunks: List[ProcessedChunk] = []
-        future = self.event_manager.get_event_future(
+        # Take the future before reading it. Cleanup of another epoch, or a
+        # cleanup that already popped it, must not free these buffers while
+        # H2D still uses them. A missing event is an empty hit.
+        future = self.event_manager.pop_event_if_done(
             EventType.LOADING, kwargs["req_id"]
         )
+        if future is None:
+            logger.warning(
+                "No completed prefetch for request %s", kwargs["req_id"]
+            )
+            return [], 0
         # As mentioned in async_lookup_and_prefetch(), the future.result()
         # is key data pair for each chunk in each tier. So extract the key
         # and memory object pairs to memory_obj_map

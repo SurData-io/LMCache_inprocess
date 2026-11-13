@@ -1,5 +1,19 @@
 # LMCache InProcess
 
+## 2026-11-13 一次释放 prefetch 缓冲
+
+`20261113-134055` 的 800×3 在第一条 Turn3 的 H2D 上退出。调度器已经按 2048 token 命中排进这一步，`retrieve` 读到的 preload `MemoryObj.valid` 是 `False`，`_broadcast_or_receive_memory_objs` 里 `raw_tensor` 为 `None` 后断言。同一条 `LOADING` future 被释放了两次：`retrieve` 拷完之后减引用，`wait_for_save` 的 `lookup_unpin` 再走 `cleanup_memory_objs`。GET 已经结束时，过期 epoch 的 `LookupCleanupMsg` 也会把当前 future 弹出来释放。日志里有 4332 次引用被减到 -1，561 次完整的 `Retrieved 2048`。磁盘读失败是 0。
+
+`retrieve` 一开始就弹出 `DONE` 的 future，缺事件就当没有命中。`lookup_unpin` 不再释放这条 future。`cleanup_memory_objs` 只在 future 没有 epoch，或 epoch 与这次 cleanup 相同的时候弹出并释放。两处 gather 的 future 写上这次 lookup 的 epoch。读盘线程池和准入不改。没有新配置项。
+
+### 已完成
+- 一条 prefetch 只被弹出一次。成功的 H2D 由 `retrieve` 释放。
+- 过期 epoch 的 cleanup 留下已经收下的缓冲。
+- 测试覆盖 epoch 不同不释放、epoch 相同只释放一次，以及 retrieve 之后 `lookup_unpin` 不再把引用减成负数。
+
+### 尚未完成
+- 没有把这次改动打进 GPU 镜像，也没有复测 800×3。
+
 ## 2026-11-12 读盘按 preload 空槽放行
 
 `20261112-151524` 第二轮 800 条索引都是 2048，调度器拿到 2048 的只有 342 条，457 条是 0。GET 的预算读的是 `memory_allocator`。20GiB 拆开之后这个对象是 store 池。申请发生在 preload 池。store 池腾出来之后，每一拍仍按那边的空闲字节再放行一批读，preload 里没有下一块就失败。
